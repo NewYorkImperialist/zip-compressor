@@ -6,7 +6,12 @@
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod output;
+mod timeconv;
+mod walk;
+mod writer;
 
 /// How each entry's data is encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,8 +118,20 @@ pub fn compress<W: Write + Seek>(
     progress: &mut dyn FnMut(&Progress),
     cancel: &AtomicBool,
 ) -> Result<Summary> {
-    let _ = (inputs, out, opts, progress, cancel);
-    todo!("Phase 1 implementation")
+    let started = Instant::now();
+    let entries = walk::scan(inputs, opts, cancel)?;
+    let written = writer::write_archive(
+        &entries,
+        out,
+        opts,
+        progress,
+        cancel,
+        Path::new("<archive output>"),
+        None,
+    )?;
+    let mut summary = written.summary;
+    summary.elapsed = started.elapsed();
+    Ok(summary)
 }
 
 /// Like [`compress`], but writes to `out_path` via a temporary file in the same
@@ -127,6 +144,5 @@ pub fn compress_to_path(
     progress: &mut dyn FnMut(&Progress),
     cancel: &AtomicBool,
 ) -> Result<Summary> {
-    let _ = (inputs, out_path, opts, progress, cancel);
-    todo!("Phase 1 implementation")
+    output::compress_to_path(inputs, out_path, opts, progress, cancel)
 }

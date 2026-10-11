@@ -2,38 +2,65 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri App</title>
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>Zip Compressor</title>
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
-    <main class="container">
-      <h1>Welcome to Tauri</h1>
+    <main class="app">
+      <section id="drop-zone" class="drop-zone" aria-label="Inputs">
+        <div id="empty-hint" class="empty-hint">
+          <p class="hint-title">Drop files or folders here</p>
+          <p class="hint-sub">or choose them below</p>
+        </div>
+        <ul id="input-list" class="input-list" hidden></ul>
+      </section>
 
       <div class="row">
-        <a href="https://tauri.app" target="_blank">
-          <img src="/assets/tauri.svg" class="logo tauri" alt="Tauri logo" />
-        </a>
-        <a
-          href="https://developer.mozilla.org/en-US/docs/Web/JavaScript"
-          target="_blank"
-        >
-          <img
-            src="/assets/javascript.svg"
-            class="logo vanilla"
-            alt="JavaScript logo"
-          />
-        </a>
+        <button id="add-files" type="button">Add Files…</button>
+        <button id="add-folder" type="button">Add Folder…</button>
+        <span class="spacer"></span>
+        <button id="clear-inputs" type="button" class="link" disabled>Clear</button>
       </div>
-      <p>Click on the Tauri logo to learn more about the framework</p>
 
-      <form class="row" id="greet-form">
-        <input id="greet-input" placeholder="Enter a name..." />
-        <button type="submit">Greet</button>
-      </form>
-      <p id="greet-msg"></p>
+      <fieldset class="options">
+        <label class="field">
+          <span>Compression</span>
+          <select id="method">
+            <option value="store">Store (no compression)</option>
+            <option value="1">Fast</option>
+            <option value="6" selected>Balanced</option>
+            <option value="9">Best</option>
+          </select>
+        </label>
+        <label class="check">
+          <input id="exclude-junk" type="checkbox" checked />
+          <span>Exclude system junk (.DS_Store, __MACOSX, Thumbs.db…)</span>
+        </label>
+      </fieldset>
+
+      <div class="row actions">
+        <button id="compress" type="button" class="primary" disabled>Compress…</button>
+        <button id="cancel" type="button" hidden>Cancel</button>
+      </div>
+
+      <section id="progress" class="progress" hidden>
+        <progress id="progress-bar" max="1" value="0"></progress>
+        <div class="progress-meta">
+          <span id="progress-text"></span>
+          <span id="progress-counts"></span>
+        </div>
+        <div id="progress-current" class="current"></div>
+      </section>
+
+      <section id="result" class="result" hidden>
+        <p id="result-title" class="result-title"></p>
+        <p id="result-detail" class="result-detail"></p>
+        <button id="reveal" type="button" hidden>Show in Finder</button>
+      </section>
     </main>
   </body>
 </html>

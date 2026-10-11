@@ -11,6 +11,12 @@ license = "MIT"
 zip.workspace = true
 walkdir.workspace = true
 thiserror.workspace = true
+# Used only to probe whether a large file is worth deflating (same zlib-rs backend zip uses).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+
+[target.'cfg(unix)'.dependencies]
+# localtime_r for converting mtimes to local DOS time.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
