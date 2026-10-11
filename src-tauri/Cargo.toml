@@ -5,7 +5,14 @@ description = "A fast, high-ratio ZIP compressor"
 authors = ["Jayden Lin"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace]
+members = ["crates/zipcore", "crates/zipc"]
+
+[workspace.dependencies]
+zipcore = { path = "crates/zipcore" }
+zip = { version = "9", default-features = false, features = ["deflate", "zstd", "xz", "aes-crypto", "time"] }
+walkdir = "2"
+thiserror = "2"
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
@@ -23,6 +30,4 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Deflate (zlib-rs + zopfli), plus zstd/xz/AES for the later "Ultra" and encryption presets.
-zip = { version = "9", default-features = false, features = ["deflate", "zstd", "xz", "aes-crypto", "time"] }
-walkdir = "2"
+zipcore.workspace = true

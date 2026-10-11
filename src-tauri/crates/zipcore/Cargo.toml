@@ -1,0 +1,18 @@
+[package]
+name = "zipcore"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Compression engine for zip-compressor"
+license = "MIT"
+
+[dependencies]
+# Deflate (zlib-rs + zopfli), plus zstd/xz/AES for the later "Ultra" and encryption presets.
+zip.workspace = true
+walkdir.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+proptest = "1"

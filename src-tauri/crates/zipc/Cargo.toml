@@ -1,0 +1,12 @@
+[package]
+name = "zipc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Command-line front end for zipcore"
+license = "MIT"
+
+[dependencies]
+zipcore.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
