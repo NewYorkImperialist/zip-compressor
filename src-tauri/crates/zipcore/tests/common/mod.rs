@@ -27,6 +27,7 @@ pub fn opts_full(method: Method, symlinks: SymlinkPolicy, exclude_junk: bool) ->
         method,
         symlinks,
         exclude_junk,
+        ..Default::default()
     }
 }
 

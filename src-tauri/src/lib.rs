@@ -73,6 +73,7 @@ impl CompressOptionsDto {
             method,
             symlinks,
             exclude_junk: self.exclude_junk,
+            ..Default::default()
         })
     }
 }

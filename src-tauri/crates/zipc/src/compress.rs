@@ -83,6 +83,7 @@ impl CompressArgs {
             },
             symlinks: self.symlinks.into(),
             exclude_junk: !self.keep_junk,
+            ..Default::default()
         }
     }
 }

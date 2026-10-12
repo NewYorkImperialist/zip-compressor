@@ -46,6 +46,9 @@ pub struct CompressOptions {
     pub symlinks: SymlinkPolicy,
     /// Leave out OS clutter: `.DS_Store`, `__MACOSX/`, AppleDouble `._*`, `Thumbs.db`, `desktop.ini`.
     pub exclude_junk: bool,
+    /// Worker threads for compression. `0` means one per available CPU core.
+    /// The archive bytes are identical whatever this is set to.
+    pub threads: usize,
 }
 
 impl Default for CompressOptions {
@@ -54,6 +57,7 @@ impl Default for CompressOptions {
             method: Method::default(),
             symlinks: SymlinkPolicy::default(),
             exclude_junk: true,
+            threads: 0,
         }
     }
 }
@@ -96,6 +100,10 @@ pub enum Error {
     NotFound(PathBuf),
     #[error("refusing to write the archive inside one of its own inputs: {0}")]
     OutputInsideInput(PathBuf),
+    #[error(
+        "two inputs would both be stored as `{0}`; rename one or pass its parent folder instead"
+    )]
+    DuplicateName(String),
     #[error("cancelled")]
     Cancelled,
 }
