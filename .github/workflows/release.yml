@@ -1,0 +1,164 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the version in src-tauri/tauri.conf.json and
+# the Cargo.toml files) to build the app installers and zipc binaries for every
+# platform and attach them to a DRAFT GitHub release; review and publish it by
+# hand. Run it manually (workflow_dispatch) to build everything without
+# creating a release.
+#
+# Builds are unsigned: macOS shows a Gatekeeper warning (right-click > Open)
+# and Windows a SmartScreen prompt until code signing is set up.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: check version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the app and crate versions
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          fail=0
+          [ "$conf" = "$tag" ] || { echo "tauri.conf.json is $conf, tag is $tag"; fail=1; }
+          for f in src-tauri/Cargo.toml src-tauri/crates/zipcore/Cargo.toml src-tauri/crates/zipc/Cargo.toml; do
+            v="$(sed -n 's/^version = "\(.*\)"/\1/p' "$f" | head -1)"
+            [ "$v" = "$tag" ] || { echo "$f is $v, tag is $tag"; fail=1; }
+          done
+          exit $fail
+
+  cli:
+    name: zipc (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
+          - { os: macos-latest, target: aarch64-apple-darwin, archive: tar.gz }
+          - { os: macos-latest, target: x86_64-apple-darwin, archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, archive: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --profile dist -p zipc --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="zipc-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          bin="src-tauri/target/${{ matrix.target }}/dist/zipc"
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          cp "$bin" README.md LICENSE "dist/$name/"
+          cd dist
+          if [ "${{ matrix.archive }}" = zip ]; then
+            7z a -tzip "$name.zip" "$name" >/dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  app:
+    name: app (${{ matrix.name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS universal, os: macos-latest, args: "--target universal-apple-darwin", rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+          - { name: Linux x86-64, os: ubuntu-22.04, args: "", rust_targets: "" }
+          - { name: Windows x86-64, os: windows-latest, args: "", rust_targets: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        with:
+          args: ${{ matrix.args }}
+
+      - name: Collect bundles
+        # artifactPaths also lists directories (the macOS .app, which ships
+        # inside the .dmg); keep the files only.
+        shell: bash
+        env:
+          PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          mkdir bundles
+          "$(command -v python3 || command -v python)" -c 'import json, os, shutil
+          for p in json.loads(os.environ["PATHS"]):
+              if os.path.isfile(p):
+                  shutil.copy(p, "bundles")
+                  print(p)'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ runner.os }}
+          path: bundles/*
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [cli, app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect files and checksums
+        run: |
+          mkdir upload
+          find artifacts -type f -exec cp {} upload/ \;
+          cd upload
+          sha256sum * > SHA256SUMS.txt
+          ls -l
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: upload/*
