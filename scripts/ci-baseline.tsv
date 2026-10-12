@@ -1,0 +1,8 @@
+# dataset	preset	archive bytes (exact, from --update)	time cap in seconds (generous; for a 3-4 core CI runner)
+silesia	fast	94108140	30
+silesia	balanced	68898935	30
+silesia	best	67583810	60
+tiny	fast	29794536	30
+tiny	balanced	20449846	30
+tiny	best	20359713	45
+tiny	max	19802956	400

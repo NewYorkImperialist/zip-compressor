@@ -46,3 +46,62 @@ jobs:
         # Run even if clippy failed, so one CI run surfaces every problem.
         if: ${{ !cancelled() }}
         run: cargo test --workspace
+
+  heavy:
+    # The slow tests (ZIP64 at 4.5 GiB, 70,000 files, Zopfli on MiBs) are
+    # #[ignore]d in debug builds; run all of them with optimizations.
+    name: release tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: release
+
+      - name: Test (release, including ignored)
+        run: cargo test --release -p zipcore -p zipc -- --include-ignored
+
+  regress:
+    # Archive sizes are deterministic: compare them with scripts/ci-baseline.tsv,
+    # and catch large slowdowns with generous time caps.
+    name: size/speed regression (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: release
+
+      - uses: actions/cache@v4
+        with:
+          path: bench-data
+          key: corpus-${{ runner.os }}-${{ hashFiles('scripts/fetch-corpus.sh', 'scripts/gen_corpus.py') }}
+
+      - name: Fetch corpus
+        run: scripts/fetch-corpus.sh silesia tiny
+
+      - name: Build zipc
+        working-directory: src-tauri
+        run: cargo build --release -p zipc
+
+      - name: Check sizes and speed
+        run: scripts/ci-regress.sh src-tauri/target/release/zipc
