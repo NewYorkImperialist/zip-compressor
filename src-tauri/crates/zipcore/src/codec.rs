@@ -21,8 +21,8 @@
 //!
 //! # Codecs
 //! A unit (a whole small file or one chunk) is encoded by its [`Codec`]:
-//! levels 1-9 are one zlib-rs pass; Best adds a level-6 attempt for small
-//! whole files and keeps the smaller; Zopfli additionally runs the Zopfli
+//! levels 1-9 are one zlib-rs pass; Best adds level-6 and level-9
+//! `FILTERED` attempts for small whole files and keeps the smallest; Zopfli additionally runs the Zopfli
 //! optimizer ([`zopfli_codec`]). Every choice is made per unit from that unit's bytes
 //! alone, and priming is input-based, so per-chunk choices are independent
 //! and the concatenation stays one valid stream.
@@ -66,17 +66,21 @@ pub(crate) fn deflate(input: &[u8], dict: &[u8], level: u32, last: bool) -> io::
 pub(crate) enum Codec {
     /// One zlib-rs pass at this level (1-9).
     Deflate(u32),
-    /// [`crate::Method::DeflateBest`]: level 9, plus level 6 for whole
-    /// files under [`BEST_SMALL`]; the smaller wins (ties: level 9).
+    /// [`crate::Method::DeflateBest`]: level 9, plus level 6 and level 9
+    /// with the `FILTERED` strategy for whole files under [`BEST_SMALL`];
+    /// the smallest wins (ties: plain level 9, then level 6).
     Best,
     /// Zopfli, plus everything [`Codec::Best`] tries; the smallest wins
     /// (ties: the zlib-rs output).
     Zopfli { iterations: u16 },
 }
 
-/// Whole files below this size get the extra level-6 attempt in Best (and
-/// Zopfli) mode: zlib-rs level 6 often beats level 9 on small text files,
-/// while on big inputs the second pass costs a lot for ~nothing.
+/// Whole files below this size get the extra attempts in Best (and Zopfli)
+/// mode: zlib-rs level 6 often beats level 9 on small text files, and
+/// `FILTERED` (which favors literals over short, far matches) often beats
+/// both on small files (-0.9% on a tree of 20,000 small files, for ~30%
+/// more time), while on big inputs the extra passes cost a lot for ~nothing
+/// (-0.09% on Silesia's chunks for twice the time).
 pub(crate) const BEST_SMALL: usize = 1 << 20;
 
 /// Hooks a slow unit calls as it goes.
@@ -162,6 +166,13 @@ pub(crate) fn encode_unit(
             return Ok(None);
         }
         let d = deflate(input, dict, 6, last)?;
+        if d.len() < best.len() {
+            best = d;
+        }
+        if (poll.interrupted)() {
+            return Ok(None);
+        }
+        let d = zlib::deflate(input, dict, 9, Strategy::Filtered, last)?;
         if d.len() < best.len() {
             best = d;
         }
@@ -424,16 +435,37 @@ mod tests {
     }
 
     #[test]
-    fn best_tries_level_6_on_small_whole_files_only() {
+    fn best_tries_more_settings_on_small_whole_files_only() {
         let data = text(200_000);
         let d9 = deflate(&data, &[], 9, true).unwrap();
         let d6 = deflate(&data, &[], 6, true).unwrap();
+        let f9 = zlib::deflate(&data, &[], 9, Strategy::Filtered, true).unwrap();
         let best = enc(&data, &[], Codec::Best, true);
-        assert_eq!(best.len(), d9.len().min(d6.len()));
-        if d6.len() >= d9.len() {
+        assert_eq!(best.len(), d9.len().min(d6.len()).min(f9.len()));
+        if d6.len() >= d9.len() && f9.len() >= d9.len() {
             assert_eq!(best, d9, "ties go to level 9");
         }
         assert!(inflate(&best, data.len()) == data);
+        // Small files of every kind: never larger than any single setting.
+        for (i, small) in [text(300), text(5000), noise(2000, 7), {
+            let mut m = text(3000);
+            m.extend(noise(500, 3));
+            m.extend(text(3000));
+            m
+        }]
+        .iter()
+        .enumerate()
+        {
+            let b = enc(small, &[], Codec::Best, true);
+            for d in [
+                deflate(small, &[], 9, true).unwrap(),
+                deflate(small, &[], 6, true).unwrap(),
+                zlib::deflate(small, &[], 9, Strategy::Filtered, true).unwrap(),
+            ] {
+                assert!(b.len() <= d.len(), "case {i}: {} > {}", b.len(), d.len());
+            }
+            assert!(inflate(&b, small.len()) == *small, "case {i}");
+        }
         // Chunks (primed, or not final) and big units are plain level 9.
         let mut s = enc(&data[..100_000], &[], Codec::Best, false);
         assert_eq!(s, enc(&data[..100_000], &[], Codec::Deflate(9), false));

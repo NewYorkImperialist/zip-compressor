@@ -34,13 +34,13 @@ pub enum Method {
     /// Deflate at the given level (0-9; higher values mean 9, 0 means Store).
     /// One zlib-rs pass per unit, whatever the level.
     Deflate { level: u8 },
-    /// Deflate; tries level 6 and level 9 per small file and keeps the
-    /// smaller (zlib-rs level 6 often beats level 9 on small text files);
-    /// plain level 9 for large files.
+    /// Deflate; tries level 9, level 6, and level 9 with zlib's `FILTERED`
+    /// strategy per small file and keeps the smallest (each wins on some
+    /// small files); plain level 9 for large files.
     ///
     /// "Small" means a file under 1 MiB, compressed whole; anything bigger,
     /// and every chunk of a file of 4 MiB or more, is one level-9 pass. Ties
-    /// go to level 9. Never larger than `Deflate { level: 9 }`, file by file.
+    /// go to plain level 9. Never larger than `Deflate { level: 9 }`, file by file.
     DeflateBest,
     /// Deflate produced by the Zopfli optimizer: same format as
     /// [`Method::Deflate`], typically 3-8% smaller, but far slower.
@@ -62,8 +62,8 @@ pub enum Preset {
     /// Deflate level 6.
     #[default]
     Balanced,
-    /// [`Method::DeflateBest`]: level 6 or 9 per small file, whichever is
-    /// smaller; level 9 for large files.
+    /// [`Method::DeflateBest`]: the smallest of several encoder settings
+    /// per small file; level 9 for large files.
     Best,
     /// Zopfli. Smallest archive; slow.
     Max,

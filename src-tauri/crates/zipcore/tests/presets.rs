@@ -2,7 +2,8 @@
 //!
 //! - Every preset round-trips a mixed tree and every entry is Stored or
 //!   Deflate (method 0 / 8), extractable by unzip, python, bsdtar and ditto.
-//! - Best (`Method::DeflateBest`) tries levels 6 and 9 per file under 1 MiB,
+//! - Best (`Method::DeflateBest`) tries levels 6 and 9 (and level 9
+//!   `FILTERED`) per file under 1 MiB,
 //!   so per small entry it is never larger than an independent zlib-rs at
 //!   levels 6 and 9; `Deflate { level: 9 }` is a single level-9 pass.
 //! - Max (Zopfli) is never larger per small entry than Best and is smaller in

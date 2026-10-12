@@ -144,7 +144,7 @@ fn describe_method(m: Method) -> String {
     match m {
         Method::Store => "Store, no compression".into(),
         Method::Deflate { level } => format!("Deflate level {level}"),
-        Method::DeflateBest => "Deflate, best of levels 6 and 9 per small file".into(),
+        Method::DeflateBest => "Deflate, best of several settings per small file".into(),
         Method::Zopfli { iterations } => format!("Zopfli, {iterations} iterations"),
     }
 }
