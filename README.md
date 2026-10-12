@@ -58,7 +58,8 @@ Options for `zipc compress`:
   an existing file unless `-f/--force` is given.
 - `-p, --preset fast|balanced|best|max` — speed/size trade-off (default `balanced`).
 - `-t, --threads N` — worker threads; `0` (default) uses every core. The
-  archive is byte-for-byte identical whatever the thread count.
+  archive is byte-for-byte identical whatever the thread count, and on any
+  CPU (checked for every preset between Apple Silicon and x86-64).
 - `--symlinks store|follow|skip` — how to treat symbolic links (default `store`).
 - `--keep-junk` — keep `.DS_Store`, `__MACOSX/`, `._*`, `Thumbs.db` and
   `desktop.ini` (they are left out by default).
@@ -69,6 +70,12 @@ Options for `zipc compress`:
 
 Exit status: 0 on success, 1 on an error, 2 on a usage error, 130 when
 interrupted with Ctrl-C (no partial archive is left behind).
+
+To check archives (any ZIP, not only zipc's), like `unzip -t`:
+
+```sh
+zipc test out.zip other.zip     # exit 0 if every entry's data and CRC-32 check out
+```
 
 ## Desktop app
 
@@ -96,7 +103,18 @@ cargo fmt --all --check
 ```
 
 Some tests check archives with `unzip -tq` when Info-ZIP's `unzip` is
-installed.
+installed. The slow tests (4.5 GiB ZIP64 entries, 70,000 files, Zopfli on
+several MiB) are ignored in debug builds; run everything with
+
+```sh
+cargo test --release -p zipcore -p zipc -- --include-ignored
+```
+
+CI also runs `scripts/ci-regress.sh`, which compresses Silesia and the tiny
+corpus with every preset and fails if an archive grows past the sizes in
+`scripts/ci-baseline.tsv` (output is deterministic, so any change is real)
+or a run blows far past its time cap. After an intended size change, refresh
+the baseline with `scripts/ci-regress.sh src-tauri/target/release/zipc --update`.
 
 ## Benchmarks
 
