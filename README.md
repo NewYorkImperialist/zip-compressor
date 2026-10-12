@@ -29,16 +29,17 @@ the input (lower is better).
 
 | Dataset | Finder (`ditto`) | `zip -9` | zipc `balanced` | zipc `best` | zipc `max` |
 |---|---|---|---|---|---|
-| Silesia corpus, 212 MB | 32.19%, 5.8 s | 31.91%, 14.7 s | 32.51%, 0.62 s | 31.89%, 1.2 s | **30.45%**, 221 s |
-| Rust source, 26 MB | 23.51%, 0.53 s | 23.48%, 1.05 s | 23.25%, 0.10 s | 23.09%, 0.16 s | **22.24%**, 24 s |
-| 20,000 small files, 42 MB | 50.98%, 3.5 s | 51.35%, 3.3 s | 48.80%, 0.42 s | 48.58%, 0.70 s | **47.25%**, 17 s |
-| One 1.3 GB file | 44.58%, 37.9 s | 44.39%, 82.6 s | 44.82%, 3.1 s | 44.35%, 8.0 s | not run |
-| Photos (HEIC/JPEG), 36 MB | 99.89%, 0.84 s | 99.84%, 1.0 s | 99.87%, 0.38 s | 99.86%, 0.23 s | **99.82%**, 3.9 s |
+| Silesia corpus, 212 MB | 32.19%, 6.0 s | 31.91%, 15.0 s | 32.51%, 0.53 s | 31.89%, 1.1 s | **30.45%**, 218 s |
+| Rust source, 26 MB | 23.51%, 0.51 s | 23.48%, 1.04 s | 23.25%, 0.10 s | 23.08%, 0.25 s | **22.24%**, 25 s |
+| 20,000 small files, 42 MB | 50.98%, 1.7 s | 51.35%, 1.7 s | 48.80%, 0.41 s | 48.16%, 0.77 s | **47.23%**, 17 s |
+| One 1.3 GB file | 44.58%, 34 s | 44.39%, 78 s | 44.82%, 3.2 s | 44.35%, 6.2 s | **43.17%**, 18 min |
+| Photos (HEIC/JPEG), 36 MB | 99.89%, 0.71 s | 99.84%, 0.87 s | 99.87%, 0.15 s | 99.86%, 0.18 s | **99.82%**, 2.1 s |
 
-In short: `balanced` is 5–12x faster than Finder at about the same size
-(2x on photos); `best` is the same size as `zip -9` or smaller (photos aside,
-by 0.02%) while running 4–12x faster; `max` is 4.6–8% smaller than `zip -9`
-on text, code and mixed data, but takes minutes on large inputs.
+In short: `balanced` is 4–11x faster than Finder at about the same size;
+`best` is the same size as `zip -9` or smaller (photos aside, by 0.02%; 6%
+smaller on many small files) while running 2–13x faster; `max` is 2.7–8%
+smaller than `zip -9` on text, code and mixed data, but takes minutes on
+large inputs (18 minutes for 1.3 GB).
 <!-- /phase3-numbers -->
 
 ## Command line
