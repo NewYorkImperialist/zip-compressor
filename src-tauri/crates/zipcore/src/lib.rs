@@ -34,9 +34,9 @@ pub enum Method {
     /// Deflate at the given level (0-9; higher values mean 9, 0 means Store).
     /// One zlib-rs pass per unit, whatever the level.
     Deflate { level: u8 },
-    /// Deflate; tries level 9, level 6, and level 9 with zlib's `FILTERED`
-    /// strategy per small file and keeps the smallest (each wins on some
-    /// small files); plain level 9 for large files.
+    /// Deflate; tries level 9 and level 6 per small file (plus level 9 with
+    /// zlib's `FILTERED` strategy when the data looks like a numeric table)
+    /// and keeps the smallest; plain level 9 for large files.
     ///
     /// "Small" means a file under 1 MiB, compressed whole; anything bigger,
     /// and every chunk of a file of 4 MiB or more, is one level-9 pass. Ties

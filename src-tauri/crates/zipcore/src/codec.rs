@@ -21,8 +21,9 @@
 //!
 //! # Codecs
 //! A unit (a whole small file or one chunk) is encoded by its [`Codec`]:
-//! levels 1-9 are one zlib-rs pass; Best adds level-6 and level-9
-//! `FILTERED` attempts for small whole files and keeps the smallest; Zopfli additionally runs the Zopfli
+//! levels 1-9 are one zlib-rs pass; Best adds a level-6 attempt (and, for
+//! data like numeric tables, a level-9 `FILTERED` one) for small whole files
+//! and keeps the smallest; Zopfli additionally runs the Zopfli
 //! optimizer ([`zopfli_codec`]). Every choice is made per unit from that unit's bytes
 //! alone, and priming is input-based, so per-chunk choices are independent
 //! and the concatenation stays one valid stream.
@@ -66,9 +67,10 @@ pub(crate) fn deflate(input: &[u8], dict: &[u8], level: u32, last: bool) -> io::
 pub(crate) enum Codec {
     /// One zlib-rs pass at this level (1-9).
     Deflate(u32),
-    /// [`crate::Method::DeflateBest`]: level 9, plus level 6 and level 9
-    /// with the `FILTERED` strategy for whole files under [`BEST_SMALL`];
-    /// the smallest wins (ties: plain level 9, then level 6).
+    /// [`crate::Method::DeflateBest`]: level 9, plus level 6 and (see
+    /// [`tries_filtered`]) level 9 with the `FILTERED` strategy for whole
+    /// files under [`BEST_SMALL`]; the smallest wins (ties: plain level 9,
+    /// then level 6).
     Best,
     /// Zopfli, plus everything [`Codec::Best`] tries; the smallest wins
     /// (ties: the zlib-rs output).
@@ -76,12 +78,23 @@ pub(crate) enum Codec {
 }
 
 /// Whole files below this size get the extra attempts in Best (and Zopfli)
-/// mode: zlib-rs level 6 often beats level 9 on small text files, and
-/// `FILTERED` (which favors literals over short, far matches) often beats
-/// both on small files (-0.9% on a tree of 20,000 small files, for ~30%
-/// more time), while on big inputs the extra passes cost a lot for ~nothing
-/// (-0.09% on Silesia's chunks for twice the time).
+/// mode: zlib-rs level 6 often beats level 9 on small text files, while on
+/// big inputs the extra passes cost a lot for ~nothing (`FILTERED` on
+/// Silesia's chunks: -0.09% for twice the time).
 pub(crate) const BEST_SMALL: usize = 1 << 20;
+
+/// Whether Best tries level 9 `FILTERED` on a small whole file that level 9
+/// shrinks from `raw` to `level9` bytes: only for a ratio of 35-75%.
+///
+/// `FILTERED` favors literals over short matches, which pays off on data
+/// like numeric tables (CSV, logs; -2% to -3% there) that land in that band.
+/// Measured on 2,600 source files, the files outside it (prose and code
+/// compress further, noise and media less) gained 0.04% for 60% more time;
+/// inside it, a tree of 20,000 small files kept 99.97% of the gain.
+pub(crate) fn tries_filtered(raw: usize, level9: usize) -> bool {
+    let (raw, l9) = (raw as u64, level9 as u64);
+    raw > 0 && l9 * 100 >= raw * 35 && l9 * 100 <= raw * 75
+}
 
 /// Hooks a slow unit calls as it goes.
 pub(crate) struct Poll<'a> {
@@ -169,12 +182,14 @@ pub(crate) fn encode_unit(
         if d.len() < best.len() {
             best = d;
         }
-        if (poll.interrupted)() {
-            return Ok(None);
-        }
-        let d = zlib::deflate(input, dict, 9, Strategy::Filtered, last)?;
-        if d.len() < best.len() {
-            best = d;
+        if tries_filtered(input.len(), base_len) {
+            if (poll.interrupted)() {
+                return Ok(None);
+            }
+            let d = zlib::deflate(input, dict, 9, Strategy::Filtered, last)?;
+            if d.len() < best.len() {
+                best = d;
+            }
         }
     }
     if let Codec::Zopfli { iterations } = codec {
@@ -439,10 +454,13 @@ mod tests {
         let data = text(200_000);
         let d9 = deflate(&data, &[], 9, true).unwrap();
         let d6 = deflate(&data, &[], 6, true).unwrap();
-        let f9 = zlib::deflate(&data, &[], 9, Strategy::Filtered, true).unwrap();
         let best = enc(&data, &[], Codec::Best, true);
-        assert_eq!(best.len(), d9.len().min(d6.len()).min(f9.len()));
-        if d6.len() >= d9.len() && f9.len() >= d9.len() {
+        assert!(
+            !tries_filtered(data.len(), d9.len()),
+            "text is outside the band"
+        );
+        assert_eq!(best.len(), d9.len().min(d6.len()));
+        if d6.len() >= d9.len() {
             assert_eq!(best, d9, "ties go to level 9");
         }
         assert!(inflate(&best, data.len()) == data);
@@ -457,11 +475,13 @@ mod tests {
         .enumerate()
         {
             let b = enc(small, &[], Codec::Best, true);
-            for d in [
-                deflate(small, &[], 9, true).unwrap(),
-                deflate(small, &[], 6, true).unwrap(),
-                zlib::deflate(small, &[], 9, Strategy::Filtered, true).unwrap(),
-            ] {
+            let d9 = deflate(small, &[], 9, true).unwrap();
+            let mut tried = vec![deflate(small, &[], 6, true).unwrap()];
+            if tries_filtered(small.len(), d9.len()) {
+                tried.push(zlib::deflate(small, &[], 9, Strategy::Filtered, true).unwrap());
+            }
+            tried.push(d9);
+            for d in tried {
                 assert!(b.len() <= d.len(), "case {i}: {} > {}", b.len(), d.len());
             }
             assert!(inflate(&b, small.len()) == *small, "case {i}");
@@ -491,6 +511,60 @@ mod tests {
             enc(&big, &[], Codec::Best, true),
             enc(&big, &[], Codec::Deflate(9), true)
         );
+    }
+
+    /// Rows of random integers, like a numeric CSV export.
+    fn csv(rows: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut out = Vec::new();
+        for _ in 0..rows {
+            for col in 0..8 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let digits = 1 + (x % 7) as u32;
+                out.extend_from_slice(
+                    (x >> 8)
+                        .rem_euclid(10u64.pow(digits))
+                        .to_string()
+                        .as_bytes(),
+                );
+                out.push(if col == 7 { b'\n' } else { b',' });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn filtered_band() {
+        assert!(!tries_filtered(0, 0));
+        assert!(!tries_filtered(100, 34));
+        assert!(tries_filtered(100, 35));
+        assert!(tries_filtered(100, 75));
+        assert!(!tries_filtered(100, 76));
+        assert!(!tries_filtered(100, 105), "stored fallback");
+    }
+
+    #[test]
+    fn best_uses_filtered_on_numeric_tables() {
+        let data = csv(100, 9);
+        let d9 = deflate(&data, &[], 9, true).unwrap();
+        assert!(
+            tries_filtered(data.len(), d9.len()),
+            "{} -> {}",
+            data.len(),
+            d9.len()
+        );
+        let f9 = zlib::deflate(&data, &[], 9, Strategy::Filtered, true).unwrap();
+        assert!(
+            f9.len() < d9.len(),
+            "FILTERED {} vs level 9 {}",
+            f9.len(),
+            d9.len()
+        );
+        let best = enc(&data, &[], Codec::Best, true);
+        assert!(best.len() <= f9.len());
+        assert!(inflate(&best, data.len()) == data);
     }
 
     #[test]
