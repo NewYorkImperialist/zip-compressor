@@ -1,22 +1,15 @@
 //! `zipc compress`.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
-use zipcore::{CompressOptions, Error, Method, Preset, Progress, Summary, SymlinkPolicy};
+use zipcore::{CompressOptions, Error, Method, Preset, Summary, SymlinkPolicy};
 
-use crate::units::{
-    format_bytes, format_duration, percent_done, ratio_percent, throughput_mb_s, truncate_start,
-};
-use crate::{Outcome, EXIT_CANCELLED};
-
-/// Minimum time between progress-line redraws.
-const REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+use crate::progress::{install_cancel_handler, ProgressLine};
+use crate::units::{format_bytes, format_duration, ratio_percent, throughput_mb_s};
+use crate::Outcome;
 
 #[derive(Debug, Args)]
 pub struct CompressArgs {
@@ -191,20 +184,10 @@ pub fn run(args: CompressArgs) -> Result<Outcome> {
         );
     }
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let cancel = Arc::clone(&cancel);
-        ctrlc::set_handler(move || {
-            // A second Ctrl-C while the engine is winding down exits at once.
-            if cancel.swap(true, Ordering::SeqCst) {
-                std::process::exit(EXIT_CANCELLED.into());
-            }
-        })
-        .context("installing Ctrl-C handler")?;
-    }
+    let cancel = install_cancel_handler()?;
 
     let show_progress = !args.quiet && std::io::stderr().is_terminal();
-    let mut bar = ProgressLine::new(show_progress);
+    let mut bar = ProgressLine::new(show_progress, "files");
     let result = zipcore::compress_to_path(
         &args.inputs,
         &args.output,
@@ -221,69 +204,6 @@ pub fn run(args: CompressArgs) -> Result<Outcome> {
         }
         Err(Error::Cancelled) => Ok(Outcome::Cancelled),
         Err(e) => Err(e).with_context(|| format!("creating {}", args.output.display())),
-    }
-}
-
-/// A single, self-overwriting status line on stderr.
-struct ProgressLine {
-    enabled: bool,
-    width: usize,
-    last_draw: Option<Instant>,
-    drawn: bool,
-}
-
-impl ProgressLine {
-    fn new(enabled: bool) -> Self {
-        let width = std::env::var("COLUMNS")
-            .ok()
-            .and_then(|c| c.parse::<usize>().ok())
-            .filter(|&w| w >= 20)
-            .unwrap_or(80);
-        Self {
-            enabled,
-            width,
-            last_draw: None,
-            drawn: false,
-        }
-    }
-
-    fn update(&mut self, p: &Progress) {
-        if !self.enabled {
-            return;
-        }
-        let complete = p.files_done >= p.files_total && p.bytes_done >= p.bytes_total;
-        let due = self
-            .last_draw
-            .is_none_or(|t| t.elapsed() >= REDRAW_INTERVAL);
-        if !due && !complete {
-            return;
-        }
-        self.last_draw = Some(Instant::now());
-
-        let head = format!(
-            "{:5.1}%  {} / {}  {}/{} files  ",
-            percent_done(p.bytes_done, p.bytes_total),
-            format_bytes(p.bytes_done),
-            format_bytes(p.bytes_total),
-            p.files_done,
-            p.files_total,
-        );
-        // Leave the last column free so the terminal never wraps.
-        let room = self.width.saturating_sub(head.chars().count() + 1);
-        let line = format!("{head}{}", truncate_start(&p.current, room));
-        let mut err = std::io::stderr().lock();
-        let _ = write!(err, "\r{line}\x1b[K");
-        let _ = err.flush();
-        self.drawn = true;
-    }
-
-    fn finish(&mut self) {
-        if self.drawn {
-            let mut err = std::io::stderr().lock();
-            let _ = write!(err, "\r\x1b[K");
-            let _ = err.flush();
-            self.drawn = false;
-        }
     }
 }
 

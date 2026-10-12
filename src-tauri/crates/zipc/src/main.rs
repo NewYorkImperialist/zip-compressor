@@ -1,6 +1,8 @@
 //! `zipc` — command-line front end for `zipcore`.
 
 mod compress;
+mod progress;
+mod testcmd;
 mod units;
 
 use std::process::ExitCode;
@@ -36,12 +38,18 @@ enum Command {
     /// Create a ZIP archive from files and directories.
     #[command(after_help = PRESETS_HELP)]
     Compress(compress::CompressArgs),
-    // Later phases: Extract, Test, Bench.
+    /// Check that archives are intact, like `unzip -t`: every entry is
+    /// decompressed and its CRC-32 and sizes compared with the headers.
+    /// Exit status 0 if all are OK, 1 if any has a problem or can't be read.
+    Test(testcmd::TestArgs),
+    // Later phases: Extract, Bench.
 }
 
 /// How a subcommand finished, mapped to the process exit status.
 pub enum Outcome {
     Ok,
+    /// Finished, but found problems (already reported); exit status 1.
+    Failed,
     Cancelled,
 }
 
@@ -49,9 +57,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Compress(args) => compress::run(args),
+        Command::Test(args) => testcmd::run(args),
     };
     match result {
         Ok(Outcome::Ok) => ExitCode::SUCCESS,
+        Ok(Outcome::Failed) => ExitCode::FAILURE,
         Ok(Outcome::Cancelled) => {
             eprintln!("cancelled");
             ExitCode::from(EXIT_CANCELLED)

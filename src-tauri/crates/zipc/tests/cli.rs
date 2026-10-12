@@ -311,3 +311,92 @@ fn help_explains_presets() {
         assert!(text.contains("slower"), "{args:?}: {text}");
     }
 }
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn test_ok_archive_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    let zip = dir.path().join("out.zip");
+    assert_eq!(compress_with(&data, &zip, &[]).status.code(), Some(0));
+
+    let out = zipc([OsStr::new("test"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("OK  "), "stdout: {text}");
+    assert!(text.contains("out.zip"), "stdout: {text}");
+    // data/, data/a.txt, data/sub/, data/sub/b.txt
+    assert!(
+        text.contains("(4 entries, 1.2 KiB checked)"),
+        "stdout: {text}"
+    );
+
+    let out = zipc([
+        OsStr::new("test"),
+        OsStr::new("-q"),
+        zip.as_os_str(),
+        zip.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("2 of 2 archives OK"));
+}
+
+#[test]
+fn test_corrupted_archive_exits_1_and_names_the_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    let zip = dir.path().join("bad.zip");
+    assert_eq!(
+        compress_with(&data, &zip, &["--store"]).status.code(),
+        Some(0)
+    );
+    let mut bytes = fs::read(&zip).unwrap();
+    let pos = bytes
+        .windows(11)
+        .position(|w| w == b"hello hello")
+        .expect("stored data");
+    bytes[pos + 3] ^= 0x20;
+    fs::write(&zip, &bytes).unwrap();
+
+    let good = dir.path().join("good.zip");
+    assert_eq!(compress_with(&data, &good, &[]).status.code(), Some(0));
+
+    let out = zipc([
+        OsStr::new("test"),
+        good.as_os_str(),
+        zip.as_os_str(),
+        OsStr::new("--quiet"),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("FAILED  "), "stdout: {text}");
+    assert!(text.contains("  data/a.txt: bad CRC-32"), "stdout: {text}");
+    assert!(text.contains("OK  "), "good archive still reported: {text}");
+    assert!(text.contains("1 of 2 archives OK"), "stdout: {text}");
+}
+
+#[test]
+fn test_non_zip_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let junk = dir.path().join("notes.txt");
+    fs::write(&junk, "definitely not a zip file\n".repeat(10)).unwrap();
+    let out = zipc([OsStr::new("test"), junk.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("not a valid ZIP archive"),
+        "{}",
+        stderr(&out)
+    );
+
+    let missing = dir.path().join("missing.zip");
+    let out = zipc([OsStr::new("test"), missing.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn test_without_archives_is_usage_error() {
+    assert_eq!(zipc(["test"]).status.code(), Some(2));
+}

@@ -7,9 +7,6 @@ description = "Compression engine for zip-compressor"
 license = "MIT"
 
 [dependencies]
-# Only for the public `Error::Zip` variant (and the later zstd/xz/AES presets);
-# archives are written by our own container writer (src/container.rs).
-zip.workspace = true
 walkdir.workspace = true
 thiserror.workspace = true
 # Raw deflate and inflate (src/zlib.rs). Used directly rather than through
@@ -21,12 +18,18 @@ zopfli = { version = "0.8.4", default-features = false, features = ["std"] }
 # Worker pool with scoped tasks (workers borrow the scanned entries; the scope
 # joins every task before `compress` returns).
 rayon = "1"
-# SIMD CRC-32 with `combine` for per-chunk CRCs (already in the tree via zip/flate2).
+# SIMD CRC-32 with `combine` for per-chunk CRCs (the same crate flate2 uses).
 crc32fast = "1.5"
 
 [target.'cfg(unix)'.dependencies]
 # localtime_r for converting mtimes to local DOS time.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Local time of a file's mtime for the DOS date/time fields, using the time-zone
+# rules in force on that date (GetDynamicTimeZoneInformation +
+# SystemTimeToTzSpecificLocalTimeEx). Same version already in the lockfile.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -34,3 +37,7 @@ filetime = "0.2"
 proptest = "1"
 # Independent deflate sizing for constructing threshold test inputs.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Independent reader/oracle for the archives we write (ZipArchive and
+# read_zipfile_from_stream). The tests only read Stored and Deflated entries,
+# so only the pure-Rust inflate backend is enabled (no zstd-sys, AES, xz).
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

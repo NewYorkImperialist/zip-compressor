@@ -61,12 +61,20 @@ pub(crate) fn civil_from_unix_utc(secs: i64) -> Civil {
     }
 }
 
-/// Local civil time for a Unix timestamp. Falls back to UTC where the local
-/// zone can't be determined (and on non-Unix platforms).
+/// Local civil time for a Unix timestamp, using the zone rules (UTC offset and
+/// daylight saving) in force at that instant rather than today's offset. Falls
+/// back to UTC where the local zone can't be determined (and on platforms that
+/// are neither Unix nor Windows).
 pub(crate) fn civil_from_unix_local(secs: i64) -> Civil {
     #[cfg(unix)]
     {
         if let Some(c) = local_unix(secs) {
+            return c;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(c) = local_windows(secs) {
             return c;
         }
     }
@@ -92,6 +100,93 @@ fn local_unix(secs: i64) -> Option<Civil> {
         minute: u8::try_from(tm.tm_min).ok()?,
         // tm_sec can be 60 for a leap second; DOS can't represent it anyway.
         second: u8::try_from(tm.tm_sec.min(59)).ok()?,
+    })
+}
+
+/// Windows: `SystemTimeToTzSpecificLocalTimeEx` with the current zone's
+/// *dynamic* information applies the UTC offset and DST rules for the year of
+/// the timestamp being converted (the registry's "Dynamic DST" data), the way
+/// Explorer displays a file's date. `FileTimeToLocalFileTime` would be wrong
+/// here: it applies today's bias to every date, so a summer mtime archived in
+/// winter would come out an hour off.
+///
+/// The zone is queried per call (it's cheap) so a long-running app picks up a
+/// time-zone change, as `localtime_r` does on Unix.
+#[cfg(windows)]
+fn local_windows(secs: i64) -> Option<Civil> {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::Time::{
+        GetDynamicTimeZoneInformation, SystemTimeToTzSpecificLocalTimeEx,
+        DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID,
+    };
+
+    let u = civil_from_unix_utc(secs);
+    // SYSTEMTIME covers 1601..=30827.
+    let year = u16::try_from(u.year)
+        .ok()
+        .filter(|y| (1601..=30827).contains(y))?;
+    let utc = SYSTEMTIME {
+        wYear: year,
+        wMonth: u16::from(u.month),
+        wDayOfWeek: u16::from(weekday_from_unix(secs)),
+        wDay: u16::from(u.day),
+        wHour: u16::from(u.hour),
+        wMinute: u16::from(u.minute),
+        wSecond: u16::from(u.second),
+        wMilliseconds: 0,
+    };
+    let mut tz = DYNAMIC_TIME_ZONE_INFORMATION::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: both calls only read/write the plain-old-data structs passed by
+    // pointer, which live for the duration of the calls.
+    unsafe {
+        if GetDynamicTimeZoneInformation(&mut tz) == TIME_ZONE_ID_INVALID {
+            return None;
+        }
+        if SystemTimeToTzSpecificLocalTimeEx(&tz, &utc, &mut local) == 0 {
+            return None;
+        }
+    }
+    civil_from_fields(
+        local.wYear,
+        local.wMonth,
+        local.wDay,
+        local.wHour,
+        local.wMinute,
+        local.wSecond,
+    )
+}
+
+/// Day of the week of a Unix timestamp, 0 = Sunday (the `SYSTEMTIME` convention).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn weekday_from_unix(secs: i64) -> u8 {
+    // 1970-01-01 was a Thursday.
+    (secs.div_euclid(86_400) + 4).rem_euclid(7) as u8
+}
+
+/// Validated civil time from broken-down fields as an OS reports them (e.g. a
+/// Windows `SYSTEMTIME`). A leap second (60) is folded into 59.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn civil_from_fields(
+    year: u16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+) -> Option<Civil> {
+    let ok = (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second <= 60;
+    ok.then(|| Civil {
+        year: i64::from(year),
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second.min(59) as u8,
     })
 }
 
@@ -239,6 +334,64 @@ mod tests {
         assert_eq!(
             got,
             (c.year, c.month, c.day, c.hour, c.minute, c.second & !1)
+        );
+    }
+
+    #[test]
+    fn weekdays() {
+        assert_eq!(weekday_from_unix(0), 4, "1970-01-01 was a Thursday");
+        assert_eq!(weekday_from_unix(86_399), 4);
+        assert_eq!(weekday_from_unix(-1), 3, "1969-12-31 was a Wednesday");
+        assert_eq!(
+            weekday_from_unix(1_700_000_000),
+            2,
+            "2023-11-14 was a Tuesday"
+        );
+        assert_eq!(
+            weekday_from_unix(951_782_400),
+            2,
+            "2000-02-29 was a Tuesday"
+        );
+    }
+
+    #[test]
+    fn fields_to_civil() {
+        assert_eq!(
+            civil_from_fields(2024, 7, 1, 23, 59, 58),
+            Some(civ(2024, 7, 1, 23, 59, 58))
+        );
+        assert_eq!(
+            civil_from_fields(2016, 12, 31, 23, 59, 60),
+            Some(civ(2016, 12, 31, 23, 59, 59)),
+            "leap second folds into :59"
+        );
+        for bad in [
+            (2024, 0, 1, 0, 0, 0),
+            (2024, 13, 1, 0, 0, 0),
+            (2024, 1, 0, 0, 0, 0),
+            (2024, 1, 32, 0, 0, 0),
+            (2024, 1, 1, 24, 0, 0),
+            (2024, 1, 1, 0, 60, 0),
+            (2024, 1, 1, 0, 0, 61),
+        ] {
+            let (y, mo, d, h, mi, s) = bad;
+            assert_eq!(civil_from_fields(y, mo, d, h, mi, s), None, "{bad:?}");
+        }
+    }
+
+    /// A broken-down local time (as the OS returns it) packs into exactly those
+    /// DOS fields: no further zone shift happens after the OS conversion.
+    #[test]
+    fn local_fields_pack_unchanged() {
+        let c = civil_from_fields(2023, 7, 15, 14, 30, 45).unwrap();
+        assert_eq!(
+            unpack(dos_fields(clamp_to_dos_range(c))),
+            (2023, 7, 15, 14, 30, 44)
+        );
+        let old = civil_from_fields(1979, 12, 31, 23, 0, 0).unwrap();
+        assert_eq!(
+            unpack(dos_fields(clamp_to_dos_range(old))),
+            (1980, 1, 1, 0, 0, 0)
         );
     }
 

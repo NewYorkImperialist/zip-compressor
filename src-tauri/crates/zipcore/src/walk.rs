@@ -26,7 +26,9 @@ pub(crate) struct Entry {
     /// Where the data comes from on disk.
     pub path: PathBuf,
     pub kind: Kind,
-    /// Unix mode bits (permission bits are what we keep), if available.
+    /// Host file attributes, if available: Unix `st_mode` (the permission bits
+    /// are what we keep) or the Windows `FILE_ATTRIBUTE_*` word. Interpreted
+    /// by `container::external_attrs` for the host this build writes.
     pub mode: Option<u32>,
     pub mtime: Option<SystemTime>,
 }
@@ -113,7 +115,13 @@ fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
     Some(md.permissions().mode())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
+    use std::os::windows::fs::MetadataExt;
+    Some(md.file_attributes())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn mode_of(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
@@ -121,6 +129,16 @@ fn mode_of(_md: &std::fs::Metadata) -> Option<u32> {
 /// Whether symlinks are followed during the walk. On non-Unix platforms
 /// symlink entries aren't representable in a meaningful way, so `Store`
 /// behaves like `Follow` there.
+///
+/// Windows junctions (mount-point reparse points) count as links here: std
+/// reports every name-surrogate reparse point (symlinks and junctions) as
+/// `is_symlink()`, so `Skip` never descends into them. When following, walkdir
+/// keeps an open handle to every ancestor directory and compares each followed
+/// directory against them by volume serial number and file index
+/// (`same_file::Handle`), so a junction or directory symlink pointing back at
+/// an ancestor is reported as a loop, which `scan` skips. Every unbounded walk
+/// must revisit an ancestor, so no extra guard is needed. Other reparse points
+/// (OneDrive placeholders, dedup, etc.) are ordinary files/directories to std.
 fn follow_links(policy: SymlinkPolicy) -> bool {
     match policy {
         SymlinkPolicy::Follow => true,

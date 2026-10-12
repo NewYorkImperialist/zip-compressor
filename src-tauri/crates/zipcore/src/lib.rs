@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 mod codec;
 mod container;
 mod output;
+mod reader;
 mod timeconv;
+mod verify;
 mod walk;
 mod writer;
 mod zlib;
@@ -264,6 +266,5 @@ pub fn test_archive(
     progress: &mut dyn FnMut(&Progress),
     cancel: &AtomicBool,
 ) -> Result<TestReport> {
-    let _ = (path, progress, cancel);
-    todo!("zipc test: archive verification")
+    verify::test_archive(path, progress, cancel)
 }

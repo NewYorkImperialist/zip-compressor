@@ -34,8 +34,8 @@ pub(crate) const ZIP64_EXTRA_ID: u16 = 0x0001;
 /// Fixed part of a local header.
 pub(crate) const LOCAL_FIXED_LEN: usize = 30;
 
-/// "Version made by": host system 3 (Unix) in the high byte, spec 6.3.
-const VERSION_MADE_BY: u16 = (3 << 8) | 63;
+/// ZIP spec version (6.3) in the low byte of "version made by".
+const SPEC_VERSION: u16 = 63;
 const VERSION_STORED: u16 = 10;
 const VERSION_DEFLATE_OR_DIR: u16 = 20;
 const VERSION_ZIP64: u16 = 45;
@@ -47,8 +47,100 @@ const U32_MAX: u64 = 0xFFFF_FFFF;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
-/// MS-DOS directory attribute (low byte of the external attributes).
-const DOS_DIR_ATTR: u32 = 0x10;
+/// MS-DOS attributes (low byte of the external attributes). The values are
+/// the Windows `FILE_ATTRIBUTE_*` bits of the same names.
+pub(crate) const DOS_READONLY: u32 = 0x01;
+pub(crate) const DOS_HIDDEN: u32 = 0x02;
+pub(crate) const DOS_SYSTEM: u32 = 0x04;
+pub(crate) const DOS_DIR_ATTR: u32 = 0x10;
+pub(crate) const DOS_ARCHIVE: u32 = 0x20;
+
+/// Host system recorded in the high byte of "version made by" (APPNOTE 4.4.2).
+/// It tells extractors how to read the external attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Host {
+    /// 0, "MS-DOS and OS/2 (FAT / VFAT / FAT32 file systems)": external
+    /// attributes are DOS attributes in the low byte.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Dos = 0,
+    /// 3: Unix `st_mode` in the high 16 bits.
+    #[cfg_attr(windows, allow(dead_code))]
+    Unix = 3,
+}
+
+/// Host written by this build.
+///
+/// On Windows we write host 0 (MS-DOS) with only the DOS attributes, which is
+/// what Windows' own "Send to > Compressed folder", 7-Zip and Info-ZIP Zip for
+/// Windows write, and so the most widely tested combination:
+/// - Windows extractors (Explorer, 7-Zip, Info-ZIP UnZip) apply the read-only,
+///   hidden, system and archive bits from a DOS-host entry; for a Unix-host
+///   entry several of them derive attributes from the Unix mode instead and
+///   drop hidden/system.
+/// - Unix extractors handle DOS hosts with sane permissions: Info-ZIP UnZip
+///   uses 0666 (0444 when read-only) for files and 0777 for directories, minus
+///   the umask; libarchive (bsdtar, macOS `tar`) uses 0664/0775 with write
+///   bits cleared for read-only; macOS Archive Utility and the zip crate use
+///   0644/0755-style defaults. Directories are recognized by the 0x10 bit and
+///   the trailing `/`, so nothing is unreadable and the directory bit survives.
+/// - A synthesized Unix mode (host 3 + DOS bits) would carry no information
+///   Windows has (there are no Unix permissions or execute bits to record),
+///   while risking the Windows-side attribute loss above.
+///
+/// Symlink entries need host 3, but Windows never produces them (`Store`
+/// follows links there, see `walk::follow_links`).
+#[cfg(windows)]
+pub(crate) const HOST: Host = Host::Dos;
+#[cfg(not(windows))]
+pub(crate) const HOST: Host = Host::Unix;
+
+/// "Version made by" for `host`.
+pub(crate) const fn version_made_by(host: Host) -> u16 {
+    ((host as u16) << 8) | SPEC_VERSION
+}
+
+/// External attributes for a Unix host: `(type | mode & 0o777) << 16`, plus
+/// the DOS directory bit for directories. `mode` is `st_mode`; `None` uses
+/// 644/755/777.
+pub(crate) fn unix_external_attrs(kind: EntryType, mode: Option<u32>) -> u32 {
+    let (ty, default) = match kind {
+        EntryType::File => (S_IFREG, 0o644),
+        EntryType::Dir => (S_IFDIR, 0o755),
+        EntryType::Symlink => (S_IFLNK, 0o777),
+    };
+    let perm = mode.map_or(default, |m| m & 0o777);
+    let dos = if kind == EntryType::Dir {
+        DOS_DIR_ATTR
+    } else {
+        0
+    };
+    ((ty | perm) << 16) | dos
+}
+
+/// External attributes for a DOS host from Windows `FILE_ATTRIBUTE_*` bits
+/// (`None`: no attributes known). Only read-only, hidden, system and archive
+/// are kept; the directory bit comes from `kind` alone. The high 16 bits stay
+/// zero (Info-ZIP UnZip would read nonzero ones as a Unix mode).
+///
+/// Read-only is dropped for directories: Windows ignores it there (Explorer
+/// uses it to mark customized folders), but Unix extractors would turn it into
+/// a directory nobody can write to.
+pub(crate) fn dos_external_attrs(kind: EntryType, win_attrs: Option<u32>) -> u32 {
+    let a = win_attrs.unwrap_or(0) & (DOS_READONLY | DOS_HIDDEN | DOS_SYSTEM | DOS_ARCHIVE);
+    match kind {
+        EntryType::Dir => (a & !DOS_READONLY) | DOS_DIR_ATTR,
+        EntryType::File | EntryType::Symlink => a,
+    }
+}
+
+/// External attributes for an entry written by `host`; `attrs` is the raw
+/// host attribute word (see [`Meta::mode`]).
+pub(crate) fn external_attrs(host: Host, kind: EntryType, attrs: Option<u32>) -> u32 {
+    match host {
+        Host::Unix => unix_external_attrs(kind, attrs),
+        Host::Dos => dos_external_attrs(kind, attrs),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EntryType {
@@ -69,8 +161,10 @@ pub(crate) enum CMethod {
 pub(crate) struct Meta<'a> {
     pub name: &'a str,
     pub kind: EntryType,
-    /// Unix mode as reported by the filesystem; only the 0o777 permission bits
-    /// are kept (the type bits come from `kind`). `None` uses 644/755/777.
+    /// Host file attributes as reported by the filesystem: on Unix `st_mode`
+    /// (only the 0o777 permission bits are kept; the type bits come from
+    /// `kind`), on Windows the `FILE_ATTRIBUTE_*` word. `None` uses defaults
+    /// (644/755/777 on Unix, no attributes on Windows). See [`external_attrs`].
     pub mode: Option<u32>,
     /// DOS (time, date).
     pub dos: (u16, u16),
@@ -110,18 +204,7 @@ impl<'a> Meta<'a> {
     }
 
     pub fn external_attributes(&self) -> u32 {
-        let (ty, default) = match self.kind {
-            EntryType::File => (S_IFREG, 0o644),
-            EntryType::Dir => (S_IFDIR, 0o755),
-            EntryType::Symlink => (S_IFLNK, 0o777),
-        };
-        let perm = self.mode.map_or(default, |m| m & 0o777);
-        let dos = if self.kind == EntryType::Dir {
-            DOS_DIR_ATTR
-        } else {
-            0
-        };
-        ((ty | perm) << 16) | dos
+        external_attrs(HOST, self.kind, self.mode)
     }
 }
 
@@ -255,7 +338,7 @@ pub(crate) fn central_header(
         extra_len += 4 + z64.len();
     }
     put32(out, CENTRAL_SIG);
-    put16(out, VERSION_MADE_BY);
+    put16(out, version_made_by(HOST));
     put16(out, version_needed);
     put16(out, meta.flags());
     put16(out, method as u16);
@@ -288,7 +371,7 @@ pub(crate) fn end_records(entries: u64, cd_offset: u64, cd_size: u64, out: &mut 
         let z64_offset = cd_offset + cd_size;
         put32(out, ZIP64_EOCD_SIG);
         put64(out, 44); // size of the remaining record
-        put16(out, (3 << 8) | VERSION_ZIP64);
+        put16(out, ((HOST as u16) << 8) | VERSION_ZIP64);
         put16(out, VERSION_ZIP64);
         put32(out, 0); // this disk
         put32(out, 0); // disk with the central directory
@@ -456,10 +539,14 @@ mod tests {
         let m = meta("ü/", EntryType::Dir);
         let mut b = Vec::new();
         central_header(&m, CMethod::Stored, 20, &Sizes::default(), 99, &mut b);
-        assert_eq!(u16_at(&b, 4), (3 << 8) | 63, "made by Unix");
+        assert_eq!(u16_at(&b, 4), version_made_by(HOST));
         assert_eq!(u16_at(&b, 8), FLAG_UTF8);
         let ext = u32_at(&b, 38);
-        assert_eq!(ext >> 16, 0o040755, "dir type + permission bits only");
+        assert_eq!(ext, m.external_attributes());
+        if HOST == Host::Unix {
+            assert_eq!(u16_at(&b, 4), (3 << 8) | 63, "made by Unix");
+            assert_eq!(ext >> 16, 0o040755, "dir type + permission bits only");
+        }
         assert_eq!(ext & 0xff, 0x10, "DOS directory bit");
         assert_eq!(u32_at(&b, 42), 99);
         assert_eq!(central_zip64_fields(&b), None);
@@ -467,29 +554,79 @@ mod tests {
 
     #[test]
     fn external_attribute_defaults() {
-        let mk = |kind, mode| Meta {
-            name: "n",
-            kind,
-            mode,
-            dos: (0, 0),
-            ext_time: None,
-        };
+        let u = unix_external_attrs;
+        assert_eq!(u(EntryType::File, None) >> 16, 0o100644);
+        assert_eq!(u(EntryType::Dir, None) >> 16, 0o040755);
+        assert_eq!(u(EntryType::Symlink, None) >> 16, 0o120777);
+        assert_eq!(u(EntryType::File, Some(0o100600)), 0o100600 << 16);
+        assert_eq!(u(EntryType::Dir, None) & 0xffff, DOS_DIR_ATTR);
+    }
+
+    #[test]
+    fn host_selection_and_made_by() {
+        assert_eq!(version_made_by(Host::Unix), 0x033F);
+        assert_eq!(version_made_by(Host::Dos), 0x003F);
+        assert_eq!(HOST, if cfg!(windows) { Host::Dos } else { Host::Unix });
+        let m = meta("f", EntryType::File);
         assert_eq!(
-            mk(EntryType::File, None).external_attributes() >> 16,
-            0o100644
+            m.external_attributes(),
+            external_attrs(HOST, EntryType::File, m.mode)
+        );
+    }
+
+    // Windows FILE_ATTRIBUTE_* values not stored in ZIP entries.
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+    const FILE_ATTRIBUTE_NOT_CONTENT_INDEXED: u32 = 0x2000;
+
+    #[test]
+    fn dos_attributes_from_windows_attributes() {
+        let d = dos_external_attrs;
+        assert_eq!(d(EntryType::File, None), 0);
+        assert_eq!(d(EntryType::Dir, None), DOS_DIR_ATTR);
+        assert_eq!(d(EntryType::File, Some(FILE_ATTRIBUTE_NORMAL)), 0);
+        assert_eq!(d(EntryType::File, Some(DOS_ARCHIVE)), 0x20);
+        assert_eq!(d(EntryType::File, Some(DOS_READONLY | DOS_ARCHIVE)), 0x21);
+        assert_eq!(d(EntryType::File, Some(DOS_HIDDEN)), 0x02);
+        assert_eq!(d(EntryType::File, Some(DOS_HIDDEN | DOS_SYSTEM)), 0x06);
+        // Irrelevant or misleading bits are dropped; the high half stays zero.
+        let noisy = FILE_ATTRIBUTE_REPARSE_POINT
+            | FILE_ATTRIBUTE_COMPRESSED
+            | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+            | 0x8000_0000
+            | DOS_READONLY;
+        assert_eq!(d(EntryType::File, Some(noisy)), DOS_READONLY);
+        // A file never carries the directory bit, a directory always does.
+        assert_eq!(d(EntryType::File, Some(DOS_DIR_ATTR | DOS_ARCHIVE)), 0x20);
+        assert_eq!(d(EntryType::Dir, Some(0)), 0x10);
+        // Read-only is dropped for directories; hidden/system are kept.
+        assert_eq!(
+            d(
+                EntryType::Dir,
+                Some(DOS_DIR_ATTR | DOS_READONLY | DOS_HIDDEN)
+            ),
+            0x12
+        );
+        assert_eq!(d(EntryType::Dir, Some(DOS_SYSTEM | DOS_READONLY)), 0x14);
+        assert_eq!(d(EntryType::Symlink, Some(DOS_ARCHIVE)), 0x20);
+    }
+
+    #[test]
+    fn external_attrs_dispatch_on_host() {
+        let a = Some(DOS_READONLY | DOS_HIDDEN);
+        assert_eq!(
+            external_attrs(Host::Dos, EntryType::File, a),
+            dos_external_attrs(EntryType::File, a)
         );
         assert_eq!(
-            mk(EntryType::Dir, None).external_attributes() >> 16,
-            0o040755
+            external_attrs(Host::Unix, EntryType::File, Some(0o100755)),
+            0o100755 << 16
         );
-        assert_eq!(
-            mk(EntryType::Symlink, None).external_attributes() >> 16,
-            0o120777
-        );
-        assert_eq!(
-            mk(EntryType::File, Some(0o100600)).external_attributes(),
-            0o100600 << 16
-        );
+        // DOS host: nothing in the high half for any kind.
+        for kind in [EntryType::File, EntryType::Dir, EntryType::Symlink] {
+            assert_eq!(external_attrs(Host::Dos, kind, Some(u32::MAX)) >> 16, 0);
+        }
     }
 
     #[test]
