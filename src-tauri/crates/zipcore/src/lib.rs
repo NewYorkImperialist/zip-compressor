@@ -161,8 +161,11 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("zip error: {0}")]
-    Zip(#[from] zip::result::ZipError),
+    /// The file is not a readable ZIP archive at all (e.g. no end-of-central-
+    /// directory record). Damage to individual entries is reported in
+    /// [`TestReport::problems`] instead.
+    #[error("not a valid ZIP archive: {0}")]
+    InvalidArchive(String),
     #[error("input not found: {0}")]
     NotFound(PathBuf),
     #[error("refusing to write the archive inside one of its own inputs: {0}")]
@@ -219,4 +222,48 @@ pub fn compress_to_path(
     cancel: &AtomicBool,
 ) -> Result<Summary> {
     output::compress_to_path(inputs, out_path, opts, progress, cancel)
+}
+
+/// One problem found by [`test_archive`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    /// Archive path of the affected entry, or `None` for archive-level problems.
+    pub entry: Option<String>,
+    pub message: String,
+}
+
+/// Result of checking an archive with [`test_archive`].
+#[derive(Debug, Clone)]
+pub struct TestReport {
+    /// Entries listed in the central directory.
+    pub entries: u64,
+    /// Total uncompressed bytes that were decompressed and checked.
+    pub bytes_checked: u64,
+    pub problems: Vec<Problem>,
+    pub elapsed: Duration,
+}
+
+impl TestReport {
+    pub fn is_ok(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// Check that the ZIP at `path` is intact, like `unzip -t`: every entry is
+/// decompressed and its CRC-32 and sizes are compared with the headers.
+///
+/// Works on archives from any tool, not just ours. Entries that cannot be
+/// verified (encrypted, or a compression method other than Stored/Deflate) are
+/// reported as problems rather than silently skipped. Nothing is written to disk.
+///
+/// Returns `Err` only when the archive cannot be read at all (I/O failure,
+/// [`Error::InvalidArchive`]) or on cancel; per-entry damage goes in the report.
+/// `progress` reports entries and uncompressed bytes checked.
+pub fn test_archive(
+    path: &Path,
+    progress: &mut dyn FnMut(&Progress),
+    cancel: &AtomicBool,
+) -> Result<TestReport> {
+    let _ = (path, progress, cancel);
+    todo!("zipc test: archive verification")
 }
