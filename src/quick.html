@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="stylesheet" href="styles.css" />
+    <title>Compressing</title>
+    <script type="module" src="/quick.js" defer></script>
+  </head>
+
+  <body>
+    <main class="app quick">
+      <p id="quick-title" class="quick-title">Preparing…</p>
+      <progress id="progress-bar" max="1"></progress>
+      <div class="progress-meta">
+        <span id="progress-text"></span>
+        <span id="progress-counts"></span>
+      </div>
+      <div id="quick-result" class="result" hidden>
+        <p id="result-title" class="result-title"></p>
+        <p id="result-detail" class="result-detail"></p>
+      </div>
+      <div class="row actions">
+        <span class="spacer"></span>
+        <button id="reveal" type="button" hidden>Show in Finder</button>
+        <button id="cancel" type="button">Cancel</button>
+      </div>
+    </main>
+  </body>
+</html>

@@ -34,13 +34,25 @@ function findChrome() {
 
 const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" };
 
-function page() {
-  const html = readFileSync(join(appDir, "index.html"), "utf8");
-  const tag = '<script type="module" src="/main.js" defer></script>';
-  if (!html.includes(tag)) throw new Error(`index.html no longer loads main.js as ${tag}; update tests/ui/run.mjs`);
+// Pages under test: the app page, its scenario script, and query strings
+// (one browser run each; quick mode runs once per case).
+const RUNS = [
+  { page: "index.html", main: "main.js", scenarios: "scenarios.js", query: "" },
+  ...["ok", "error", "cancel", "close", "none"].map((c) => ({
+    page: "quick.html",
+    main: "quick.js",
+    scenarios: "quick-scenarios.js",
+    query: `?case=${c}`,
+  })),
+];
+
+function page(run) {
+  const html = readFileSync(join(appDir, run.page), "utf8");
+  const tag = `<script type="module" src="/${run.main}" defer></script>`;
+  if (!html.includes(tag)) throw new Error(`${run.page} no longer loads ${run.main} as ${tag}; update tests/ui/run.mjs`);
   return html.replace(
     tag,
-    `<script src="/__smoke/mock-tauri.js"></script>\n    ${tag}\n    <script type="module" src="/__smoke/scenarios.js"></script>`,
+    `<script src="/__smoke/mock-tauri.js"></script>\n    ${tag}\n    <script type="module" src="/__smoke/${run.scenarios}"></script>`,
   );
 }
 
@@ -61,8 +73,8 @@ if (!chrome) {
   process.exit(2);
 }
 
-let finish;
-const done = new Promise((r) => (finish = r));
+let current = null;
+let finish = () => {};
 
 const server = createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
@@ -75,8 +87,8 @@ const server = createServer((req, res) => {
     });
     return;
   }
-  if (url.pathname === "/" || url.pathname === "/index.html") {
-    res.writeHead(200, { "content-type": "text/html" }).end(page());
+  if (url.pathname === "/" + current.page) {
+    res.writeHead(200, { "content-type": "text/html" }).end(page(current));
   } else if (url.pathname.startsWith("/__smoke/")) {
     serveFile(res, here.replace(/[\\/]$/, ""), url.pathname.slice("/__smoke/".length));
   } else {
@@ -84,8 +96,9 @@ const server = createServer((req, res) => {
   }
 });
 
-server.listen(0, "127.0.0.1", () => {
-  const { port } = server.address();
+// Load one page in a fresh headless browser; resolves to its results.
+function runPage(port, run) {
+  current = run;
   const profile = mkdtempSync(join(tmpdir(), "ui-smoke-"));
   const browser = spawn(
     chrome,
@@ -96,32 +109,40 @@ server.listen(0, "127.0.0.1", () => {
       "--no-default-browser-check",
       ...(process.platform === "linux" ? ["--no-sandbox"] : []),
       `--user-data-dir=${profile}`,
-      `http://127.0.0.1:${port}/`,
+      `http://127.0.0.1:${port}/${run.page}${run.query}`,
     ],
     { stdio: "ignore" },
   );
-  const timer = setTimeout(() => finish(null), TIMEOUT_MS);
-
-  done.then((results) => {
-    clearTimeout(timer);
-    browser.kill();
-    server.close();
-    try {
-      rmSync(profile, { recursive: true, force: true });
-    } catch {}
-    if (!results) {
-      console.error(`ui-smoke: no results within ${TIMEOUT_MS / 1000} s`);
-      process.exit(1);
-    }
-    let failed = 0;
-    for (const r of results) {
-      console.log(`${r.ok ? "ok  " : "FAIL"}  ${r.name}`);
-      if (!r.ok) {
-        failed++;
-        console.log(`      ${r.error.replace(/\n/g, "\n      ")}`);
-      }
-    }
-    console.log(`\n${results.length - failed} passed, ${failed} failed`);
-    process.exit(failed ? 1 : 0);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => finish(null), TIMEOUT_MS);
+    finish = (results) => {
+      finish = () => {};
+      clearTimeout(timer);
+      browser.kill();
+      try {
+        rmSync(profile, { recursive: true, force: true });
+      } catch {}
+      resolve(results ?? [{ name: `${run.page}${run.query}`, ok: false, error: `no results within ${TIMEOUT_MS / 1000} s` }]);
+    };
   });
+}
+
+server.listen(0, "127.0.0.1", async () => {
+  const { port } = server.address();
+  const results = [];
+  for (const run of RUNS) {
+    const prefix = run.page === "index.html" ? "" : `quick ${run.query.slice(6)}: `;
+    for (const r of await runPage(port, run)) results.push({ ...r, name: prefix + r.name });
+  }
+  server.close();
+  let failed = 0;
+  for (const r of results) {
+    console.log(`${r.ok ? "ok  " : "FAIL"}  ${r.name}`);
+    if (!r.ok) {
+      failed++;
+      console.log(`      ${r.error.replace(/\n/g, "\n      ")}`);
+    }
+  }
+  console.log(`\n${results.length - failed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
 });

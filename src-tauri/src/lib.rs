@@ -2,13 +2,16 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{State, WebviewUrl, WebviewWindowBuilder};
 use zipcore::{CompressOptions, Method, Preset, Progress, Summary, SymlinkPolicy};
+
+mod integration;
+mod quick;
 
 /// Minimum spacing between progress events sent to the webview (~20/s).
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
@@ -236,13 +239,123 @@ fn cancel(state: State<'_, AppState>) {
     state.cancel.store(true, Ordering::SeqCst);
 }
 
+/// The quick-mode job (`--quick PATH...`), if the app was started that way.
+struct QuickState(Mutex<Option<QuickJobDto>>);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickJobDto {
+    inputs: Vec<String>,
+    output: String,
+}
+
+impl QuickJobDto {
+    fn new(inputs: Vec<PathBuf>) -> Self {
+        let output = quick::output_for(&inputs);
+        QuickJobDto {
+            inputs: inputs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            output: output.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+#[tauri::command]
+fn quick_job(state: State<'_, QuickState>) -> Option<QuickJobDto> {
+    state.0.lock().unwrap().clone()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IntegrationDto {
+    supported: bool,
+    installed: bool,
+    label: &'static str,
+}
+
+fn integration_dto() -> IntegrationDto {
+    IntegrationDto {
+        supported: integration::SUPPORTED,
+        installed: integration::SUPPORTED && integration::installed(),
+        label: integration::LABEL,
+    }
+}
+
+#[tauri::command]
+fn integration_status() -> IntegrationDto {
+    integration_dto()
+}
+
+#[tauri::command]
+fn set_integration(enabled: bool) -> Result<IntegrationDto, String> {
+    let r = if enabled {
+        integration::install()
+    } else {
+        integration::uninstall()
+    };
+    r.map_err(|e| e.to_string())?;
+    Ok(integration_dto())
+}
+
+/// Quick-mode inputs, or `None` for a normal start. `Err` means another
+/// process took this one's paths (Windows multi-selection): exit quietly.
+fn quick_inputs() -> Result<Option<Vec<PathBuf>>, ()> {
+    let Some(paths) = quick::from_args(std::env::args_os().skip(1)) else {
+        return Ok(None);
+    };
+    #[cfg(windows)]
+    let paths = match quick::gather(paths, &std::env::temp_dir().join("zipc-quick")) {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    Ok(Some(paths).filter(|p| !p.is_empty()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let Ok(quick) = quick_inputs() else {
+        return;
+    };
+    let job = quick.map(QuickJobDto::new);
+    let quick_mode = job.is_some();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![compress, cancel])
+        .manage(QuickState(Mutex::new(job)))
+        .invoke_handler(tauri::generate_handler![
+            compress,
+            cancel,
+            quick_job,
+            integration_status,
+            set_integration
+        ])
+        .setup(move |app| {
+            if quick_mode {
+                WebviewWindowBuilder::new(app, "quick", WebviewUrl::App("quick.html".into()))
+                    .title("Compressing")
+                    .inner_size(460.0, 168.0)
+                    .resizable(false)
+                    .minimizable(false)
+                    .maximizable(false)
+                    .center()
+                    .focused(true)
+                    .build()?;
+            } else {
+                let config = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|w| w.label == "main")
+                    .cloned()
+                    .ok_or("no main window in tauri.conf.json")?;
+                WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -66,6 +66,29 @@ const scenarios = [
     check(mock.dragHandler, "drag-and-drop handler registered");
   }],
 
+  ["right-click menu setting", async () => {
+    check(visible("integration"), "setting shown when supported");
+    eq($("integration-toggle").textContent, "Add", "offers to add");
+    $("integration-toggle").click();
+    await settle();
+    eq(invokes("set_integration").at(-1)[2], { enabled: true }, "asks to install");
+    eq($("integration-toggle").textContent, "Remove", "offers to remove once installed");
+    check($("integration-text").textContent.includes("Compress with zipc"), "names the menu item");
+    $("integration-toggle").click();
+    await settle();
+    eq(invokes("set_integration").at(-1)[2], { enabled: false }, "asks to uninstall");
+    eq($("integration-toggle").textContent, "Add", "back to add");
+
+    mock.integrationError = "permission denied";
+    $("integration-toggle").click();
+    await settle();
+    eq($("result").dataset.kind, "error", "install failure shown");
+    check($("result-detail").textContent.includes("permission denied"), "error detail");
+    check(!$("integration-toggle").disabled, "can retry");
+    mock.integrationError = null;
+    $("result").hidden = true;
+  }],
+
   ["add files and folders, no duplicates, picker cancel", async () => {
     mock.dialog.open.push(["/home/u/docs/report.txt", "/home/u/docs/photos"]);
     $("add-files").click();

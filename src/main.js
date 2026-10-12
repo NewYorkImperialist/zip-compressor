@@ -352,6 +352,38 @@ async function reveal() {
   }
 }
 
+// ---------- right-click menu ----------
+
+// Where the item shows up, per OS.
+function integrationWhere() {
+  if (isWindows) return "in Explorer's right-click menu (Windows 11: Show more options)";
+  if (navigator.userAgent.includes("Mac")) return "in Finder's right-click menu, under Quick Actions";
+  return "in the file manager's right-click menu (Scripts in GNOME Files)";
+}
+
+function renderIntegration(st) {
+  const box = $("integration");
+  box.hidden = !st.supported;
+  if (!st.supported) return;
+  $("integration-text").textContent = st.installed
+    ? `“${st.label}” is ${integrationWhere()}.`
+    : `Add “${st.label}” to the right-click menu.`;
+  $("integration-toggle").textContent = st.installed ? "Remove" : "Add";
+  $("integration-toggle").disabled = false;
+  $("integration-toggle").dataset.installed = st.installed ? "1" : "";
+}
+
+async function toggleIntegration() {
+  const btn = $("integration-toggle");
+  btn.disabled = true;
+  try {
+    renderIntegration(await invoke("set_integration", { enabled: !btn.dataset.installed }));
+  } catch (e) {
+    btn.disabled = false;
+    showResult("error", "Could not change the right-click menu", String(e));
+  }
+}
+
 // ---------- drag and drop ----------
 
 async function setupDragDrop() {
@@ -382,6 +414,10 @@ window.addEventListener("DOMContentLoaded", () => {
   $("cancel").addEventListener("click", cancelJob);
   $("reveal").addEventListener("click", reveal);
   $("preset").addEventListener("change", renderPresetHint);
+  $("integration-toggle").addEventListener("click", toggleIntegration);
+  invoke("integration_status")
+    .then(renderIntegration)
+    .catch((e) => console.error("integration status:", e));
   renderPresetHint();
   renderInputs();
   setupDragDrop().catch((e) => console.error("drag-drop unavailable:", e));

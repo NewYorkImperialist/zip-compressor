@@ -93,6 +93,23 @@ Drop files or folders on the window (or use Add Files / Add Folder), pick a
 preset, and choose where to save. Long runs show elapsed time and an estimate
 of the time left.
 
+### Right-click "Compress with zipc"
+
+In the app, click **Add** next to "Add “Compress with zipc” to the right-click
+menu" (and **Remove** to take it out again). Then right-click files or folders:
+
+- **macOS:** Finder > Quick Actions > Compress with zipc (a Quick Action in
+  `~/Library/Services`).
+- **Windows:** Explorer > Show more options > Compress with zipc (a verb under
+  `HKEY_CURRENT_USER\Software\Classes`; multi-selections become one archive).
+- **Linux:** GNOME Files and Nemo > Scripts > Compress with zipc, and
+  Dolphin's context menu.
+
+It makes `Name.zip` next to the selection (`Archive.zip` for several items,
+`… 2.zip` if the name is taken) with the `balanced` preset, in a small progress
+window that closes itself when done. The same thing from a terminal:
+`zip-compressor --quick PATH...`.
+
 ## Tests
 
 From `src-tauri/`:
@@ -114,7 +131,8 @@ cargo test --release -p zipcore -p zipc -- --include-ignored
 The app's front end has a headless smoke test (needs Node and Chrome or
 Chromium; no npm packages): it loads the real `src/index.html` and `main.js`
 with a mock Tauri API and clicks through adding inputs, drag and drop,
-presets, progress, success, cancel and errors.
+presets, progress, success, cancel and errors, plus the right-click
+quick-mode window (`quick.html`).
 
 ```sh
 node tests/ui/run.mjs

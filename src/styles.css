@@ -327,3 +327,49 @@ progress {
 .result button {
   margin-top: 6px;
 }
+
+/* ---------- right-click menu setting ---------- */
+
+.integration {
+  margin-top: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.integration button.link {
+  font-size: 12px;
+}
+
+/* ---------- quick mode (right-click "Compress with zipc") ---------- */
+
+.app.quick {
+  gap: 10px;
+  padding: 16px 18px;
+  overflow: hidden;
+}
+
+.quick-title {
+  margin: 0;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.quick .result {
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.quick .result-title:empty {
+  display: none;
+}
+
+.quick .result[data-kind="error"] .result-detail {
+  color: var(--danger);
+}
+
+.quick .actions {
+  margin-top: auto;
+}
