@@ -66,10 +66,14 @@ fn trim_trailing_separators(p: &Path) -> PathBuf {
 #[cfg(any(windows, test))]
 pub fn gather(paths: Vec<PathBuf>, spool: &Path) -> Option<Vec<PathBuf>> {
     use std::fs::{self, File};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const QUIET: Duration = Duration::from_millis(400);
     const MAX_WAIT: Duration = Duration::from_secs(5);
+    // Drop-off names must be unique: the clock alone can repeat (macOS ticks
+    // in microseconds), and threads share a pid.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
 
     if fs::create_dir_all(spool).is_err() {
         return Some(paths);
@@ -86,7 +90,8 @@ pub fn gather(paths: Vec<PathBuf>, spool: &Path) -> Option<Vec<PathBuf>> {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos());
-            let name = format!("{}-{nanos}", std::process::id());
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let name = format!("{}-{nanos}-{seq}", std::process::id());
             let tmp = spool.join(format!("{name}.tmp"));
             let body = join_paths(&paths);
             let done = spool.join(format!("{name}.paths"));
