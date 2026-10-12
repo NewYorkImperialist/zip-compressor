@@ -7,7 +7,9 @@ use std::path::Path;
 
 use common::*;
 use filetime::FileTime;
-use zipcore::{Method, SymlinkPolicy};
+use zipcore::Method;
+#[cfg(unix)]
+use zipcore::SymlinkPolicy;
 
 const DEFLATE: Method = Method::Deflate { level: 6 };
 

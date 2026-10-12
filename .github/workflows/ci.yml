@@ -43,4 +43,6 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        # Run even if clippy failed, so one CI run surfaces every problem.
+        if: ${{ !cancelled() }}
         run: cargo test --workspace
