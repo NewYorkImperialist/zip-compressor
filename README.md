@@ -110,6 +110,15 @@ several MiB) are ignored in debug builds; run everything with
 cargo test --release -p zipcore -p zipc -- --include-ignored
 ```
 
+The app's front end has a headless smoke test (needs Node and Chrome or
+Chromium; no npm packages): it loads the real `src/index.html` and `main.js`
+with a mock Tauri API and clicks through adding inputs, drag and drop,
+presets, progress, success, cancel and errors.
+
+```sh
+node tests/ui/run.mjs
+```
+
 CI also runs `scripts/ci-regress.sh`, which compresses Silesia and the tiny
 corpus with every preset and fails if an archive grows past the sizes in
 `scripts/ci-baseline.tsv` (output is deterministic, so any change is real)
