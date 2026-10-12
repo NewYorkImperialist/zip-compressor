@@ -20,9 +20,15 @@
 //!
 //! Units run on a dedicated rayon pool of `threads` workers; the workers do
 //! all file reading too (opening many tiny files dominates for source trees).
-//! Each unit sends exactly one message back over a channel to the calling
-//! thread, which keeps a reorder buffer and writes units strictly in scan
-//! order. The calling thread is also the dispatcher, so all scheduling state
+//! Consecutive small files are handed out in batches (one pool task and one
+//! message for up to 64 files, see [`batch_limits`]), so a tiny file costs
+//! its own work rather than a task hand-off and a wake-up of the writer
+//! each; within a batch the worker keeps the next few files open with an OS
+//! read-ahead requested (see [`readahead`]), so a cold page cache doesn't
+//! mean one synchronous disk read per file. Each task sends exactly one
+//! message (results for each of its units) back over a channel to the
+//! calling thread, which keeps a reorder buffer and writes units strictly in
+//! scan order. The calling thread is also the dispatcher, so all scheduling state
 //! (budget, cursors, reorder buffer) is single-threaded and lock-free, and the
 //! `progress` callback (not `Send`) is only ever called there. Zopfli units
 //! count the input bytes of every piece they finish into a shared counter,
@@ -52,8 +58,10 @@
 //! per byte of a [`zopfli_codec`] piece, at most ~10 MiB) and its extra
 //! buffers (max unit ~35 MiB), and gets `threads x (that + 4 MiB)` more
 //! budget so every worker can still be busy. Not counted: one deflate state
-//! per busy worker (~300 KB), the 256 KiB output buffer, and the central
-//! directory, which is kept in memory (~70 bytes + name per entry).
+//! per busy worker (~400 KB at most, far less for tiny files), the 256 KiB
+//! output buffer, and the central directory, which is kept in memory
+//! (~70 bytes + name per entry). Read-ahead holds at most a quarter of the
+//! process's open-file limit in descriptors (and at most 1024).
 //!
 //! # Determinism
 //! Entries are written in scan order whatever order workers finish in; each
@@ -118,6 +126,8 @@ const POLL: Duration = Duration::from_millis(50);
 
 const MIB: u64 = 1 << 20;
 
+mod readahead;
+
 /// In-flight byte budget for `threads` workers.
 pub(crate) fn budget_for(threads: usize) -> u64 {
     (threads as u64 * 16 * MIB).clamp(64 * MIB, 512 * MIB)
@@ -171,6 +181,31 @@ fn codec_for(m: Method) -> Option<Codec> {
     }
 }
 
+/// Small-file batch limits `(files, input bytes)` for `threads` workers:
+/// at most 64 files, and at most a few milliseconds of `codec` work, but
+/// small enough that there are about 8 batches per worker (so a small tree
+/// still spreads over the whole pool). The first file of a batch is always
+/// taken whatever its size.
+///
+/// Batching only changes which worker compresses which file, never the
+/// bytes, so these may depend on the thread count.
+fn batch_limits(entries: &[Entry], threads: usize, codec: Option<Codec>) -> (usize, u64) {
+    let (count, bytes) = entries.iter().fold((0u64, 0u64), |(c, b), e| match e.kind {
+        Kind::File { size } if size < BIG_FILE => (c + 1, b + size),
+        _ => (c, b),
+    });
+    let per = threads as u64 * 8;
+    let work_cap: u64 = match codec {
+        None => 4 << 20,
+        Some(Codec::Deflate(_)) => 512 << 10,
+        Some(Codec::Best) => 256 << 10,
+        Some(Codec::Zopfli { .. }) => 16 << 10,
+    };
+    let files = (count / per).clamp(1, 64) as usize;
+    let bytes = (bytes / per).clamp(1, work_cap);
+    (files, bytes)
+}
+
 /// Estimated peak buffer use of a unit over `len` input bytes encoded with
 /// `codec` (`None`: stored).
 fn unit_cost(len: u64, codec: Option<Codec>) -> u64 {
@@ -184,6 +219,20 @@ fn unit_cost(len: u64, codec: Option<Codec>) -> u64 {
         // and its scratch memory.
         Some(Codec::Zopfli { .. }) => 6 * len + 2 * fixed + zopfli_codec::SCRATCH_MAX,
     }
+}
+
+/// Budget reserved for a batch of small files: they run one at a time, so
+/// the peak is the biggest file's [`unit_cost`] plus the finished outputs
+/// held until the batch reports back (summing every file's working memory
+/// instead would starve the pool under Zopfli, whose per-unit scratch is
+/// megabytes).
+fn batch_cost(max_unit: u64, held: u64) -> u64 {
+    max_unit + held
+}
+
+/// Bound on the output a finished small file of `len` bytes holds.
+fn small_held(len: u64) -> u64 {
+    len + len / 8 + 256
 }
 
 /// Output sink: buffered, with position tracking and in-place patching.
@@ -293,21 +342,30 @@ impl Unit {
 enum Msg {
     /// A probe's verdict, sent ahead of its chunk by slow codecs.
     Decision { idx: usize, probe: Probe },
-    /// A finished (or failed) unit.
+    /// A finished (or failed) job: one result per unit it covered.
     Done {
-        key: Key,
+        /// Budget reserved for the whole job.
         cost: u64,
-        /// Input bytes this unit reported through `Shared::advanced`.
-        credited: u64,
-        res: Result<Unit>,
+        units: Vec<Done>,
     },
 }
 
+/// One unit's result.
+struct Done {
+    key: Key,
+    /// Input bytes this unit reported through `Shared::advanced`.
+    credited: u64,
+    res: Result<Unit>,
+}
+
+/// A piece of work for one worker task.
 enum Job {
-    Small {
-        size: u64,
-    },
+    /// A batch of small files `(entry index, size)`, in scan order: one task
+    /// and one message for many tiny files, so per-file costs are a file's
+    /// own work rather than a task hand-off and a writer wake-up each.
+    Small { files: Vec<(usize, u64)> },
     Chunk {
+        idx: usize,
         size: u64,
         k: u64,
         method: Option<CMethod>,
@@ -327,6 +385,8 @@ struct Shared<'a> {
     /// Input bytes slow units have finished so far (Zopfli pieces), for
     /// progress while they run.
     advanced: AtomicU64,
+    /// Small files each worker opens ahead within a batch (0: none).
+    readahead: usize,
 }
 
 impl Shared<'_> {
@@ -414,12 +474,28 @@ fn cancelled_or<T>(r: Option<T>) -> Result<T> {
     r.ok_or(Error::Cancelled)
 }
 
-fn run_small(entry: &Entry, size: u64, cx: &Ctx<'_>) -> Result<SmallOut> {
+/// Encode small file `entry` of scanned size `size`, from `file` if the
+/// read-ahead window already opened it.
+fn run_small(
+    entry: &Entry,
+    size: u64,
+    file: Option<File>,
+    window: &mut readahead::Window<'_>,
+    cx: &Ctx<'_>,
+) -> Result<SmallOut> {
     let io_err = |e| Error::Io {
         path: entry.path.clone(),
         source: e,
     };
-    let file = File::open(&entry.path).map_err(io_err)?;
+    let file = match file {
+        Some(f) => Ok(f),
+        None => File::open(&entry.path).or_else(|_| {
+            // Maybe out of descriptors: give back the read-ahead ones.
+            window.close_all();
+            File::open(&entry.path)
+        }),
+    }
+    .map_err(io_err)?;
     let mut raw = Vec::with_capacity(size as usize);
     file.take(size).read_to_end(&mut raw).map_err(io_err)?;
     let crc = crc32fast::hash(&raw);
@@ -542,15 +618,91 @@ fn run_chunk(
     }
 }
 
-fn run_job(entry: &Entry, job: Job, cx: &Ctx<'_>) -> Result<Unit> {
+/// Run one unit of entry `idx` on a worker: `f` with that unit's hooks,
+/// panics turned into errors. Returns the input bytes it credited to
+/// `Shared::advanced` and its result.
+fn run_unit(
+    shared: &Shared<'_>,
+    tx: &Sender<Msg>,
+    entry: &Entry,
+    idx: usize,
+    f: impl FnOnce(&Ctx<'_>) -> Result<Unit>,
+) -> (u64, Result<Unit>) {
+    if shared.skip(idx) {
+        return (0, Err(Error::Cancelled));
+    }
+    let credited = std::cell::Cell::new(0u64);
+    let interrupted = || shared.skip(idx);
+    let advanced = |n| {
+        credited.set(credited.get() + n);
+        shared.advanced.fetch_add(n, Ordering::Relaxed);
+    };
+    let on_decision = |probe| {
+        let _ = tx.send(Msg::Decision { idx, probe });
+    };
+    let cx = Ctx {
+        codec: shared.codec,
+        poll: Poll {
+            interrupted: &interrupted,
+            advanced: &advanced,
+        },
+        on_decision: &on_decision,
+    };
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| f(&cx))).unwrap_or_else(|_| {
+        Err(Error::Io {
+            path: entry.path.clone(),
+            source: io::Error::other("compression worker panicked"),
+        })
+    });
+    (credited.get(), res)
+}
+
+/// Run `job` on a worker; one result per unit, in order.
+fn run_job(entries: &[Entry], shared: &Shared<'_>, tx: &Sender<Msg>, job: Job) -> Vec<Done> {
     match job {
-        Job::Small { size } => run_small(entry, size, cx).map(Unit::Small),
+        Job::Small { files } => {
+            let mut out = Vec::with_capacity(files.len());
+            let mut window = readahead::Window::new(entries, &files, shared.readahead);
+            let mut failed = false;
+            for (i, &(idx, size)) in files.iter().enumerate() {
+                let entry = &entries[idx];
+                // After a failure the rest of the batch isn't needed (the
+                // writer stops at the first error in scan order); once
+                // cancelled, nothing is.
+                let (credited, res) = if failed || shared.skip(idx) {
+                    (0, Err(Error::Cancelled))
+                } else {
+                    let file = window.take(i);
+                    run_unit(shared, tx, entry, idx, |cx| {
+                        run_small(entry, size, file, &mut window, cx).map(Unit::Small)
+                    })
+                };
+                failed |= res.is_err();
+                out.push(Done {
+                    key: (idx, 0),
+                    credited,
+                    res,
+                });
+            }
+            out
+        }
         Job::Chunk {
+            idx,
             size,
             k,
             method,
             file,
-        } => run_chunk(entry, size, k, method, file, cx).map(Unit::Chunk),
+        } => {
+            let entry = &entries[idx];
+            let (credited, res) = run_unit(shared, tx, entry, idx, |cx| {
+                run_chunk(entry, size, k, method, file, cx).map(Unit::Chunk)
+            });
+            vec![Done {
+                key: (idx, k),
+                credited,
+                res,
+            }]
+        }
     }
 }
 
@@ -579,6 +731,10 @@ struct Engine<'s, 'p, W: Write + Seek> {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     max_probes: usize,
+    /// Most small files, and most input bytes (beyond the first file), in
+    /// one batch.
+    batch_files: usize,
+    batch_bytes: u64,
 
     budget: u64,
     used: u64,
@@ -699,49 +855,17 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
         }
     }
 
-    fn spawn(&mut self, scope: &rayon::Scope<'s>, key: Key, cost: u64, job: Job) {
+    /// Hand `job` (covering `units` units, reserving `cost`) to the pool.
+    fn spawn(&mut self, scope: &rayon::Scope<'s>, cost: u64, units: usize, job: Job) {
         let tx = self.tx.clone();
         let shared = self.shared;
-        let entry = &self.entries[key.0];
+        let entries = self.entries;
         self.in_flight += 1;
-        self.outstanding += 1;
+        self.outstanding += units;
         scope.spawn(move |_| {
-            let credited = std::cell::Cell::new(0u64);
-            let res = if shared.skip(key.0) {
-                Err(Error::Cancelled)
-            } else {
-                let interrupted = || shared.skip(key.0);
-                let advanced = |n| {
-                    credited.set(credited.get() + n);
-                    shared.advanced.fetch_add(n, Ordering::Relaxed);
-                };
-                let on_decision = |probe| {
-                    let _ = tx.send(Msg::Decision { idx: key.0, probe });
-                };
-                let cx = Ctx {
-                    codec: shared.codec,
-                    poll: Poll {
-                        interrupted: &interrupted,
-                        advanced: &advanced,
-                    },
-                    on_decision: &on_decision,
-                };
-                std::panic::catch_unwind(AssertUnwindSafe(|| run_job(entry, job, &cx)))
-                    .unwrap_or_else(|_| {
-                        Err(Error::Io {
-                            path: entry.path.clone(),
-                            source: io::Error::other("compression worker panicked"),
-                        })
-                    })
-            };
+            let units = run_job(entries, shared, &tx, job);
             // The writer may already have returned; then nobody needs this.
-            let credited = credited.get();
-            let _ = tx.send(Msg::Done {
-                key,
-                cost,
-                credited,
-                res,
-            });
+            let _ = tx.send(Msg::Done { cost, units });
         });
     }
 
@@ -760,12 +884,46 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                 }
             };
             if size < BIG_FILE {
-                let cost = unit_cost(size, codec);
+                let mut max_unit = unit_cost(size, codec);
+                let mut held = small_held(size);
+                let mut cost = batch_cost(max_unit, held);
                 if !self.admit(cost, idx == self.w_idx) {
                     break;
                 }
-                self.spawn(scope, (idx, 0), cost, Job::Small { size });
                 self.d_idx += 1;
+                // Batch the small files that follow (directories and
+                // symlinks in between need no work), up to the next big file.
+                let mut files = vec![(idx, size)];
+                let mut bytes = size;
+                while files.len() < self.batch_files
+                    && self.d_idx < n
+                    && self.d_idx <= stop
+                    && self.outstanding + files.len() < MAX_OUTSTANDING
+                {
+                    let size = match self.entries[self.d_idx].kind {
+                        Kind::File { size } if size < BIG_FILE => size,
+                        Kind::File { .. } => break,
+                        _ => {
+                            self.d_idx += 1;
+                            continue;
+                        }
+                    };
+                    let grown = batch_cost(
+                        max_unit.max(unit_cost(size, codec)),
+                        held + small_held(size),
+                    );
+                    if bytes + size > self.batch_bytes || !self.admit(grown - cost, false) {
+                        break;
+                    }
+                    files.push((self.d_idx, size));
+                    bytes += size;
+                    max_unit = max_unit.max(unit_cost(size, codec));
+                    held += small_held(size);
+                    cost = grown;
+                    self.d_idx += 1;
+                }
+                let units = files.len();
+                self.spawn(scope, cost, units, Job::Small { files });
                 continue;
             }
             let chunks = codec::chunk_count(size);
@@ -783,6 +941,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
             let (start, end) = codec::chunk_range(size, k);
             let (cost, job) = if k == 0 {
                 let job = Job::Chunk {
+                    idx,
                     size,
                     k,
                     method: None,
@@ -795,6 +954,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                 };
                 let chunk_codec = codec.filter(|_| p.method == CMethod::Deflated);
                 let job = Job::Chunk {
+                    idx,
                     size,
                     k,
                     method: Some(p.method),
@@ -807,7 +967,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
             if !self.admit(cost, next_needed) {
                 break;
             }
-            self.spawn(scope, (idx, k), cost, job);
+            self.spawn(scope, cost, 1, job);
             self.d_chunk += 1;
         }
 
@@ -830,12 +990,13 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                         break;
                     }
                     let job = Job::Chunk {
+                        idx,
                         size,
                         k: 0,
                         method: None,
                         file: None,
                     };
-                    self.spawn(scope, (idx, 0), cost, job);
+                    self.spawn(scope, cost, 1, job);
                     self.probed.insert(idx);
                     self.probes_ahead += 1;
                 }
@@ -845,20 +1006,26 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
     }
 
     fn receive(&mut self, msg: Msg) {
-        let (key, cost, credited, mut res) = match msg {
+        let (cost, units) = match msg {
             Msg::Decision { idx, probe } => {
                 self.decisions.entry(idx).or_insert(probe);
                 return;
             }
-            Msg::Done {
-                key,
-                cost,
-                credited,
-                res,
-            } => (key, cost, credited, res),
+            Msg::Done { cost, units } => (cost, units),
         };
         self.in_flight -= 1;
         self.used -= cost;
+        for d in units {
+            self.receive_unit(d);
+        }
+    }
+
+    fn receive_unit(&mut self, d: Done) {
+        let Done {
+            key,
+            credited,
+            mut res,
+        } = d;
         match &mut res {
             Ok(Unit::Chunk(c)) => {
                 if let Some(p) = c.probe.take() {
@@ -1168,6 +1335,7 @@ pub(crate) fn write_archive<W: Write + Seek>(
         stop_after: AtomicUsize::new(usize::MAX),
         codec,
         advanced: AtomicU64::new(0),
+        readahead: readahead::depth_for(threads),
     };
     let (tx, rx) = mpsc::channel();
     let files_total = entries
@@ -1182,6 +1350,8 @@ pub(crate) fn write_archive<W: Write + Seek>(
         })
         .sum();
 
+    let (batch_files, batch_bytes) = batch_limits(entries, threads, codec);
+
     let shared_ref = &shared;
     let mut written = pool.in_place_scope(|scope| {
         // Whatever happens below, queued units become no-ops before the
@@ -1193,6 +1363,8 @@ pub(crate) fn write_archive<W: Write + Seek>(
             tx,
             rx,
             max_probes: threads.min(16),
+            batch_files,
+            batch_bytes,
             budget: budget_with(threads, codec),
             used: 0,
             in_flight: 0,
