@@ -155,3 +155,159 @@ fn threads_must_be_a_number() {
     let out = zipc(["compress", "a", "-o", "a.zip", "--threads", "many"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// Run `zipc compress DATA -o ZIP -q EXTRA...` and return its output.
+fn compress_with(data: &Path, zip: &Path, extra: &[&str]) -> Output {
+    let mut args = vec![
+        OsStr::new("compress"),
+        data.as_os_str(),
+        OsStr::new("-o"),
+        zip.as_os_str(),
+        OsStr::new("-q"),
+    ];
+    args.extend(extra.iter().map(OsStr::new));
+    zipc(args)
+}
+
+/// `unzip -tq` the archive when Info-ZIP's unzip is installed.
+fn assert_unzip_ok(zip: &Path) {
+    match Command::new("unzip").arg("-tq").arg(zip).output() {
+        Ok(out) => assert!(
+            out.status.success(),
+            "unzip -tq rejected {}: {}{}",
+            zip.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(_) => eprintln!("unzip not available; skipping archive check"),
+    }
+}
+
+#[test]
+fn every_preset_makes_a_valid_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    for preset in ["fast", "balanced", "best", "max"] {
+        let zip = dir.path().join(format!("{preset}.zip"));
+        let out = compress_with(&data, &zip, &["--preset", preset]);
+        assert_eq!(out.status.code(), Some(0), "{preset}: {}", stderr(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(&format!("preset {preset} (")),
+            "stdout: {stdout}"
+        );
+        assert!(fs::read(&zip).unwrap().starts_with(b"PK"));
+        assert_unzip_ok(&zip);
+    }
+}
+
+#[test]
+fn short_preset_flag_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    let zip = dir.path().join("out.zip");
+    let out = compress_with(&data, &zip, &["-p", "fast"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("preset fast (Deflate level 1)"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn default_is_balanced_and_matches_the_preset() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    let default_zip = dir.path().join("default.zip");
+    let balanced_zip = dir.path().join("balanced.zip");
+
+    let out = compress_with(&data, &default_zip, &[]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("preset balanced (Deflate level 6)"),
+        "stdout: {stdout}"
+    );
+
+    let out = compress_with(&data, &balanced_zip, &["--preset", "balanced"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        fs::read(&default_zip).unwrap(),
+        fs::read(&balanced_zip).unwrap()
+    );
+}
+
+#[test]
+fn overrides_are_reported_as_custom_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    for (i, (extra, expect)) in [
+        (&["-l", "3"][..], "Deflate level 3"),
+        (&["--store"][..], "Store, no compression"),
+        (&["--zopfli-iterations", "2"][..], "Zopfli, 2 iterations"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let zip = dir.path().join(format!("o{i}.zip"));
+        let out = compress_with(&data, &zip, extra);
+        assert_eq!(out.status.code(), Some(0), "{extra:?}: {}", stderr(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expect), "stdout: {stdout}");
+        assert!(!stdout.contains("preset"), "stdout: {stdout}");
+        assert_unzip_ok(&zip);
+    }
+}
+
+#[test]
+fn unknown_preset_is_usage_error() {
+    let out = zipc(["compress", "a", "-o", "a.zip", "--preset", "ultra"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn preset_conflicts_with_overrides() {
+    for extra in [
+        &["--level", "3"][..],
+        &["--store"][..],
+        &["--zopfli-iterations", "5"][..],
+    ] {
+        let mut args = vec!["compress", "a", "-o", "a.zip", "--preset", "best"];
+        args.extend_from_slice(extra);
+        let out = zipc(&args);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn zopfli_iterations_conflicts_with_level_and_store() {
+    for extra in [&["--level", "3"][..], &["--store"][..]] {
+        let mut args = vec!["compress", "a", "-o", "a.zip", "--zopfli-iterations", "5"];
+        args.extend_from_slice(extra);
+        let out = zipc(&args);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn zopfli_iterations_must_be_positive() {
+    let out = zipc(["compress", "a", "-o", "a.zip", "--zopfli-iterations", "0"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn help_explains_presets() {
+    for args in [&["--help"][..], &["compress", "--help"][..]] {
+        let out = zipc(args);
+        assert_eq!(out.status.code(), Some(0));
+        let text = String::from_utf8_lossy(&out.stdout);
+        for preset in ["fast", "balanced", "best", "max"] {
+            assert!(
+                text.contains(preset),
+                "{args:?} help lacks {preset}: {text}"
+            );
+        }
+        assert!(text.contains("slower"), "{args:?}: {text}");
+    }
+}

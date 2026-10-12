@@ -14,6 +14,8 @@ mod output;
 mod timeconv;
 mod walk;
 mod writer;
+mod zlib;
+mod zopfli_codec;
 
 /// How each entry's data is encoded.
 ///
@@ -27,11 +29,26 @@ mod writer;
 pub enum Method {
     /// No compression.
     Store,
-    /// Deflate at the given level (0-9).
+    /// Deflate at the given level (0-9; higher values mean 9, 0 means Store).
+    /// One zlib-rs pass per unit, whatever the level.
     Deflate { level: u8 },
+    /// Deflate; tries level 6 and level 9 per small file and keeps the
+    /// smaller (zlib-rs level 6 often beats level 9 on small text files);
+    /// plain level 9 for large files.
+    ///
+    /// "Small" means a file under 1 MiB, compressed whole; anything bigger,
+    /// and every chunk of a file of 4 MiB or more, is one level-9 pass. Ties
+    /// go to level 9. Never larger than `Deflate { level: 9 }`, file by file.
+    DeflateBest,
     /// Deflate produced by the Zopfli optimizer: same format as
     /// [`Method::Deflate`], typically 3-8% smaller, but far slower.
-    /// `iterations` trades time for size (Zopfli's default is 15).
+    /// `iterations` trades time for size (Zopfli's default is 15); 0 is
+    /// treated as 1 and values above 1000 as 1000.
+    ///
+    /// Each unit also gets everything [`Method::DeflateBest`] tries and keeps
+    /// the smallest result, so it is never larger than level 9 (or
+    /// `DeflateBest`) unit by unit.
+    /// Units that level 9 shrinks by less than 0.1% skip Zopfli entirely.
     Zopfli { iterations: u16 },
 }
 
@@ -43,7 +60,8 @@ pub enum Preset {
     /// Deflate level 6.
     #[default]
     Balanced,
-    /// Deflate level 9, trying several encoder settings per small file.
+    /// [`Method::DeflateBest`]: level 6 or 9 per small file, whichever is
+    /// smaller; level 9 for large files.
     Best,
     /// Zopfli. Smallest archive; slow.
     Max,
@@ -56,7 +74,7 @@ impl Preset {
         match self {
             Preset::Fast => Method::Deflate { level: 1 },
             Preset::Balanced => Method::Deflate { level: 6 },
-            Preset::Best => Method::Deflate { level: 9 },
+            Preset::Best => Method::DeflateBest,
             Preset::Max => Method::Zopfli { iterations: 15 },
         }
     }

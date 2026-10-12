@@ -7,10 +7,15 @@
 //!   it, reads it whole, computes its CRC and its exact deflated size, and
 //!   keeps Deflate only if that is strictly smaller than the file (else Store);
 //! - a big file is one unit per [`codec::CHUNK`]. Chunk 0 doubles as the
-//!   probe: if deflate saves less than 0.5% on it, the whole file is Stored
-//!   (video, archives, photos stay fast). Otherwise every chunk is deflated
-//!   independently (see [`codec`]); chunks 1.. are dispatched once the probe
-//!   result is in, so they know which method to use;
+//!   probe: if one deflate pass (at the level, or level 9 for DeflateBest
+//!   and Zopfli) saves less than 0.1% on it (0.5% at level 1), the whole file is
+//!   Stored (video, archives, photos stay fast). Otherwise every chunk is
+//!   encoded independently (see [`codec`]), each one falling back to stored
+//!   blocks on its own if that is smaller; chunks 1.. are dispatched once the
+//!   probe verdict is in, so they know which method to use. With Zopfli the
+//!   probe sends its verdict as soon as the single
+//!   pass is done, before it goes on to encode chunk 0 properly, so the other
+//!   chunks don't wait for that;
 //! - directories and symlinks need no work and are written inline.
 //!
 //! Units run on a dedicated rayon pool of `threads` workers; the workers do
@@ -19,7 +24,12 @@
 //! thread, which keeps a reorder buffer and writes units strictly in scan
 //! order. The calling thread is also the dispatcher, so all scheduling state
 //! (budget, cursors, reorder buffer) is single-threaded and lock-free, and the
-//! `progress` callback (not `Send`) is only ever called there.
+//! `progress` callback (not `Send`) is only ever called there. Zopfli units
+//! count the input bytes of every piece they finish into a shared counter,
+//! so while they run the writer still reports progress about every
+//! [`PROGRESS_INTERVAL`]: `bytes_done` is then the bytes written plus those
+//! already compressed by units not yet written (monotonic, never above the
+//! total, and equal to it at the end).
 //!
 //! To keep the pool busy across big files, chunk 0 of upcoming big files is
 //! dispatched ahead of the main cursor (at most `threads.min(16)` such probes
@@ -36,15 +46,22 @@
 //! budget (head-of-line). When that exception applies, every other unit
 //! still holding budget is an outstanding probe, so buffered data never
 //! exceeds `budget + max unit cost` (about 9 MiB: a just-under-4 MiB small
-//! file needs room for its input and its deflate output). Not counted: one
-//! deflate state per busy worker (~300 KB), the 256 KiB output buffer, and the
-//! central directory, which is kept in memory (~70 bytes + name per entry).
+//! file needs room for its input and its deflate output). Unit costs depend
+//! on the codec: DeflateBest keeps one output while trying the other
+//! (~3x the input); Zopfli also counts its scratch memory (~4 MiB + 48 bytes
+//! per byte of a [`zopfli_codec`] piece, at most ~10 MiB) and its extra
+//! buffers (max unit ~35 MiB), and gets `threads x (that + 4 MiB)` more
+//! budget so every worker can still be busy. Not counted: one deflate state
+//! per busy worker (~300 KB), the 256 KiB output buffer, and the central
+//! directory, which is kept in memory (~70 bytes + name per entry).
 //!
 //! # Determinism
 //! Entries are written in scan order whatever order workers finish in; each
 //! unit's bytes depend only on its input data, the level and its position
 //! (chunk boundaries are fixed by the file size), never on scheduling or the
-//! number of threads. The deflate compressor is reset between uses.
+//! number of threads. Every encoder is created fresh for each use (see
+//! [`crate::zlib`]), and the Best / Zopfli choices are made per unit from the
+//! unit's own sizes with a fixed tie-break order.
 //!
 //! # File contents snapshot
 //! A regular file is archived as its first `size` bytes, `size` being what the
@@ -61,21 +78,25 @@
 //! first one in scan order. On cancel the writer returns
 //! [`Error::Cancelled`] within one progress step or 50 ms; queued units are
 //! skipped and running ones finish their current unit before the call
-//! returns (the pool scope joins them, so no work outlives the call).
+//! returns (the pool scope joins them, so no work outlives the call). Slow
+//! units poll for cancellation as they go: DeflateBest between its two
+//! attempts, Zopfli between pieces (each well under a second of work on typical data, see
+//! [`zopfli_codec`]); an interrupted unit produces no output.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::codec::{self, CrcCombiner, BIG_FILE, DICT};
+use crate::codec::{self, Codec, CrcCombiner, Poll, BIG_FILE, DICT};
 use crate::container::{self, CMethod, EntryType, Meta, Sizes};
 use crate::walk::{Entry, Kind};
+use crate::zopfli_codec;
 use crate::{CompressOptions, Error, Method, Progress, Result, Summary};
 
 /// Report progress at least this often while streaming one big file.
@@ -89,6 +110,9 @@ const ZIP64_RESERVE: u64 = 0xF000_0000;
 /// Cap on dispatched-but-unwritten units (bounds the reorder buffer and the
 /// queue for trees of millions of empty files).
 const MAX_OUTSTANDING: usize = 8192;
+/// While slow units run, progress is reported about this often (as long as
+/// some Zopfli piece finished since the last report).
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 /// How long the writer waits for a result before re-checking `cancel`.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -97,6 +121,18 @@ const MIB: u64 = 1 << 20;
 /// In-flight byte budget for `threads` workers.
 pub(crate) fn budget_for(threads: usize) -> u64 {
     (threads as u64 * 16 * MIB).clamp(64 * MIB, 512 * MIB)
+}
+
+/// In-flight byte budget for `threads` workers running `codec`: Zopfli
+/// units carry their scratch memory, so they get room for one each on top.
+fn budget_with(threads: usize, codec: Option<Codec>) -> u64 {
+    let base = budget_for(threads);
+    match codec {
+        Some(Codec::Zopfli { .. }) => {
+            base + threads as u64 * (zopfli_codec::SCRATCH_MAX + 4 * codec::CHUNK as u64)
+        }
+        _ => base,
+    }
 }
 
 /// Worker count for the `threads` option (0 = one per core).
@@ -109,7 +145,8 @@ pub(crate) fn worker_count(threads: usize) -> usize {
 }
 
 /// Effective method: deflate level clamped to 0..=9; level 0 means Store
-/// (deflate-0 is just Store with overhead).
+/// (deflate-0 is just Store with overhead); Zopfli iterations clamped to
+/// 1..=1000.
 fn effective_method(m: Method) -> Method {
     match m {
         Method::Store => Method::Store,
@@ -117,17 +154,35 @@ fn effective_method(m: Method) -> Method {
             0 => Method::Store,
             l => Method::Deflate { level: l },
         },
-        // Phase 3 placeholder until the new codecs land.
-        Method::Zopfli { .. } => Method::Deflate { level: 9 },
+        Method::DeflateBest => Method::DeflateBest,
+        Method::Zopfli { iterations } => Method::Zopfli {
+            iterations: iterations.clamp(1, zopfli_codec::MAX_ITERATIONS),
+        },
     }
 }
 
-/// Estimated peak buffer use of a unit over `len` input bytes.
-fn unit_cost(len: u64, compress: bool) -> u64 {
-    if compress {
-        2 * len + len / 8 + DICT as u64 + 256
-    } else {
-        len + 256
+/// The codec for `m`, or `None` for Store.
+fn codec_for(m: Method) -> Option<Codec> {
+    match effective_method(m) {
+        Method::Store => None,
+        Method::Deflate { level } => Some(Codec::Deflate(u32::from(level))),
+        Method::DeflateBest => Some(Codec::Best),
+        Method::Zopfli { iterations } => Some(Codec::Zopfli { iterations }),
+    }
+}
+
+/// Estimated peak buffer use of a unit over `len` input bytes encoded with
+/// `codec` (`None`: stored).
+fn unit_cost(len: u64, codec: Option<Codec>) -> u64 {
+    let fixed = DICT as u64 + 256;
+    match codec {
+        None => len + 256,
+        Some(Codec::Deflate(_)) => 2 * len + len / 8 + fixed,
+        // Input, best output so far, current attempt.
+        Some(Codec::Best) => 3 * len + len / 4 + fixed,
+        // Plus Zopfli's raw and realigned outputs, the verification buffer
+        // and its scratch memory.
+        Some(Codec::Zopfli { .. }) => 6 * len + 2 * fixed + zopfli_codec::SCRATCH_MAX,
     }
 }
 
@@ -235,10 +290,17 @@ impl Unit {
     }
 }
 
-struct Msg {
-    key: Key,
-    cost: u64,
-    res: Result<Unit>,
+enum Msg {
+    /// A probe's verdict, sent ahead of its chunk by slow codecs.
+    Decision { idx: usize, probe: Probe },
+    /// A finished (or failed) unit.
+    Done {
+        key: Key,
+        cost: u64,
+        /// Input bytes this unit reported through `Shared::advanced`.
+        credited: u64,
+        res: Result<Unit>,
+    },
 }
 
 enum Job {
@@ -260,8 +322,11 @@ struct Shared<'a> {
     abort: AtomicBool,
     /// Units of entries after this index aren't needed (an earlier one failed).
     stop_after: AtomicUsize,
-    /// Deflate level, or `None` for Store.
-    level: Option<u32>,
+    /// How to encode, or `None` for Store.
+    codec: Option<Codec>,
+    /// Input bytes slow units have finished so far (Zopfli pieces), for
+    /// progress while they run.
+    advanced: AtomicU64,
 }
 
 impl Shared<'_> {
@@ -337,7 +402,19 @@ fn shrink(mut v: Vec<u8>) -> Vec<u8> {
     v
 }
 
-fn run_small(entry: &Entry, size: u64, level: Option<u32>) -> Result<SmallOut> {
+/// What a worker needs besides its job: how to encode, whether to stop, and
+/// where to send an early probe verdict.
+struct Ctx<'a> {
+    codec: Option<Codec>,
+    poll: Poll<'a>,
+    on_decision: &'a dyn Fn(Probe),
+}
+
+fn cancelled_or<T>(r: Option<T>) -> Result<T> {
+    r.ok_or(Error::Cancelled)
+}
+
+fn run_small(entry: &Entry, size: u64, cx: &Ctx<'_>) -> Result<SmallOut> {
     let io_err = |e| Error::Io {
         path: entry.path.clone(),
         source: e,
@@ -347,8 +424,9 @@ fn run_small(entry: &Entry, size: u64, level: Option<u32>) -> Result<SmallOut> {
     file.take(size).read_to_end(&mut raw).map_err(io_err)?;
     let crc = crc32fast::hash(&raw);
     let size = raw.len() as u64;
-    if let Some(level) = level.filter(|_| !raw.is_empty()) {
-        let d = codec::deflate(&raw, &[], level, true).map_err(io_err)?;
+    if let Some(codec) = cx.codec.filter(|_| !raw.is_empty()) {
+        let d = codec::encode_unit(&raw, &[], codec, true, None, &cx.poll).map_err(io_err)?;
+        let d = cancelled_or(d)?;
         if d.len() < raw.len() {
             return Ok(SmallOut {
                 method: CMethod::Deflated,
@@ -372,7 +450,7 @@ fn run_chunk(
     k: u64,
     method: Option<CMethod>,
     file: Option<Arc<File>>,
-    level: Option<u32>,
+    cx: &Ctx<'_>,
 ) -> Result<ChunkOut> {
     let path = &entry.path;
     let file = match file {
@@ -402,12 +480,20 @@ fn run_chunk(
         let raw = read_range(&file, start, end, path)?;
         let crc = crc32fast::hash(&raw);
         let tail = tail_crc(&raw);
-        let (method, data) = match level {
+        let (method, data) = match cx.codec {
             None => (CMethod::Stored, raw),
-            Some(level) => {
-                let d = codec::deflate(&raw, &[], level, last).map_err(io_err)?;
-                if codec::probe_says_deflate(raw.len(), d.len()) {
-                    (CMethod::Deflated, shrink(d))
+            Some(codec) => {
+                let d = codec::deflate(&raw, &[], codec.base_level(), last).map_err(io_err)?;
+                if codec.probe_says_deflate(raw.len(), d.len()) {
+                    if codec.slow() {
+                        (cx.on_decision)(Probe {
+                            method: CMethod::Deflated,
+                            file: Some(file.clone()),
+                        });
+                    }
+                    let data = codec::encode_chunk(&raw, &[], codec, last, Some(d), &cx.poll)
+                        .map_err(io_err)?;
+                    (CMethod::Deflated, shrink(cancelled_or(data)?))
                 } else {
                     (CMethod::Stored, raw)
                 }
@@ -428,16 +514,17 @@ fn run_chunk(
 
     match method {
         Some(CMethod::Deflated) => {
-            let level = level.expect("deflated chunk without a level");
+            let codec = cx.codec.expect("deflated chunk without a codec");
             let buf = read_range(&file, start - DICT as u64, end, path)?;
             let (dict, input) = buf.split_at(DICT);
-            let data = codec::encode_chunk(input, dict, level, last).map_err(io_err)?;
+            let data =
+                codec::encode_chunk(input, dict, codec, last, None, &cx.poll).map_err(io_err)?;
             Ok(ChunkOut {
                 raw_len: end - start,
                 crc: crc32fast::hash(input),
                 dict_crc: crc32fast::hash(dict),
                 tail_crc: tail_crc(input),
-                data: shrink(data),
+                data: shrink(cancelled_or(data)?),
                 probe: None,
             })
         }
@@ -455,15 +542,15 @@ fn run_chunk(
     }
 }
 
-fn run_job(entry: &Entry, job: Job, level: Option<u32>) -> Result<Unit> {
+fn run_job(entry: &Entry, job: Job, cx: &Ctx<'_>) -> Result<Unit> {
     match job {
-        Job::Small { size } => run_small(entry, size, level).map(Unit::Small),
+        Job::Small { size } => run_small(entry, size, cx).map(Unit::Small),
         Job::Chunk {
             size,
             k,
             method,
             file,
-        } => run_chunk(entry, size, k, method, file, level).map(Unit::Chunk),
+        } => run_chunk(entry, size, k, method, file, cx).map(Unit::Chunk),
     }
 }
 
@@ -505,7 +592,8 @@ struct Engine<'s, 'p, W: Write + Seek> {
     probes_ahead: usize,
     probed: HashSet<usize>,
     decisions: HashMap<usize, Probe>,
-    ready: Reorder<Key, (u64, Result<Unit>)>,
+    /// Arrived units: (budget held, bytes credited to progress, result).
+    ready: Reorder<Key, (u64, u64, Result<Unit>)>,
 
     // Writing.
     w_idx: usize,
@@ -523,6 +611,14 @@ struct Engine<'s, 'p, W: Write + Seek> {
     bytes_done: u64,
     bytes_total: u64,
     last_report: u64,
+    last_report_at: Instant,
+    /// `Shared::advanced` as of the last report.
+    seen_advanced: u64,
+    /// Credited bytes of units already taken for writing (those bytes are in
+    /// `bytes_done` now).
+    credit_written: u64,
+    /// Last `bytes_done` reported.
+    shown: u64,
     files: u64,
     dirs: u64,
     symlinks: u64,
@@ -546,18 +642,40 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
 
     fn report(&mut self, current: &str) -> Result<()> {
         self.last_report = self.bytes_done;
+        self.last_report_at = Instant::now();
+        // Bytes written, plus bytes that running or finished-but-unwritten
+        // slow units have already compressed; monotonic and <= total.
+        self.seen_advanced = self.shared.advanced.load(Ordering::Relaxed);
+        let in_flight = self.seen_advanced.saturating_sub(self.credit_written);
+        let shown = (self.bytes_done + in_flight)
+            .min(self.bytes_total)
+            .max(self.shown);
+        self.shown = shown;
         (self.progress)(&Progress {
             current: current.to_string(),
             files_done: self.files_done,
             files_total: self.files_total,
-            bytes_done: self.bytes_done,
+            bytes_done: shown,
             bytes_total: self.bytes_total,
         });
         self.check_cancel()
     }
 
+    /// Report work done inside slow units if there is news and the last
+    /// report is [`PROGRESS_INTERVAL`] old.
+    fn report_in_flight(&mut self) -> Result<()> {
+        if self.w_idx < self.entries.len()
+            && self.shared.advanced.load(Ordering::Relaxed) != self.seen_advanced
+            && self.last_report_at.elapsed() >= PROGRESS_INTERVAL
+        {
+            let entries = self.entries;
+            self.report(&entries[self.w_idx].name)?;
+        }
+        Ok(())
+    }
+
     fn compressing(&self) -> bool {
-        self.shared.level.is_some()
+        self.shared.codec.is_some()
     }
 
     /// Method (and open file) for the chunks of big entry `idx`, if known.
@@ -588,10 +706,27 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
         self.in_flight += 1;
         self.outstanding += 1;
         scope.spawn(move |_| {
+            let credited = std::cell::Cell::new(0u64);
             let res = if shared.skip(key.0) {
                 Err(Error::Cancelled)
             } else {
-                std::panic::catch_unwind(AssertUnwindSafe(|| run_job(entry, job, shared.level)))
+                let interrupted = || shared.skip(key.0);
+                let advanced = |n| {
+                    credited.set(credited.get() + n);
+                    shared.advanced.fetch_add(n, Ordering::Relaxed);
+                };
+                let on_decision = |probe| {
+                    let _ = tx.send(Msg::Decision { idx: key.0, probe });
+                };
+                let cx = Ctx {
+                    codec: shared.codec,
+                    poll: Poll {
+                        interrupted: &interrupted,
+                        advanced: &advanced,
+                    },
+                    on_decision: &on_decision,
+                };
+                std::panic::catch_unwind(AssertUnwindSafe(|| run_job(entry, job, &cx)))
                     .unwrap_or_else(|_| {
                         Err(Error::Io {
                             path: entry.path.clone(),
@@ -600,7 +735,13 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                     })
             };
             // The writer may already have returned; then nobody needs this.
-            let _ = tx.send(Msg { key, cost, res });
+            let credited = credited.get();
+            let _ = tx.send(Msg::Done {
+                key,
+                cost,
+                credited,
+                res,
+            });
         });
     }
 
@@ -608,7 +749,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
     fn dispatch(&mut self, scope: &rayon::Scope<'s>) {
         let n = self.entries.len();
         let stop = self.shared.stop_after.load(Ordering::Relaxed);
-        let compress = self.compressing();
+        let codec = self.shared.codec;
         while self.d_idx < n && self.d_idx <= stop && self.outstanding < MAX_OUTSTANDING {
             let idx = self.d_idx;
             let size = match self.entries[idx].kind {
@@ -619,15 +760,11 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                 }
             };
             if size < BIG_FILE {
-                if !self.admit(unit_cost(size, compress), idx == self.w_idx) {
+                let cost = unit_cost(size, codec);
+                if !self.admit(cost, idx == self.w_idx) {
                     break;
                 }
-                self.spawn(
-                    scope,
-                    (idx, 0),
-                    unit_cost(size, compress),
-                    Job::Small { size },
-                );
+                self.spawn(scope, (idx, 0), cost, Job::Small { size });
                 self.d_idx += 1;
                 continue;
             }
@@ -651,19 +788,19 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                     method: None,
                     file: None,
                 };
-                (unit_cost(end - start, compress), job)
+                (unit_cost(end - start, codec), job)
             } else {
                 let Some(p) = self.decision(idx) else {
                     break; // waiting for the probe
                 };
-                let deflate = p.method == CMethod::Deflated;
+                let chunk_codec = codec.filter(|_| p.method == CMethod::Deflated);
                 let job = Job::Chunk {
                     size,
                     k,
                     method: Some(p.method),
                     file: p.file,
                 };
-                (unit_cost(end - start, deflate), job)
+                (unit_cost(end - start, chunk_codec), job)
             };
             let next_needed =
                 self.w_idx == idx && self.big.as_ref().map_or(0, |b| b.next_chunk) == k;
@@ -675,7 +812,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
         }
 
         // Probe upcoming big files early.
-        if !compress {
+        if codec.is_none() {
             return;
         }
         self.p_idx = self.p_idx.max(self.d_idx + 1);
@@ -688,7 +825,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
             if let Kind::File { size } = self.entries[idx].kind {
                 if size >= BIG_FILE {
                     let (start, end) = codec::chunk_range(size, 0);
-                    let cost = unit_cost(end - start, true);
+                    let cost = unit_cost(end - start, codec);
                     if !self.admit(cost, false) {
                         break;
                     }
@@ -708,32 +845,42 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
     }
 
     fn receive(&mut self, msg: Msg) {
+        let (key, cost, credited, mut res) = match msg {
+            Msg::Decision { idx, probe } => {
+                self.decisions.entry(idx).or_insert(probe);
+                return;
+            }
+            Msg::Done {
+                key,
+                cost,
+                credited,
+                res,
+            } => (key, cost, credited, res),
+        };
         self.in_flight -= 1;
-        self.used -= msg.cost;
-        let mut res = msg.res;
+        self.used -= cost;
         match &mut res {
             Ok(Unit::Chunk(c)) => {
                 if let Some(p) = c.probe.take() {
-                    self.decisions.insert(msg.key.0, p);
+                    self.decisions.entry(key.0).or_insert(p);
                 }
             }
             Ok(Unit::Small(_)) => {}
             Err(Error::Cancelled) => {}
             Err(_) => {
-                self.shared
-                    .stop_after
-                    .fetch_min(msg.key.0, Ordering::Relaxed);
+                self.shared.stop_after.fetch_min(key.0, Ordering::Relaxed);
             }
         }
         let held = res.as_ref().map_or(0, Unit::held);
         self.used += held;
-        self.ready.insert(msg.key, (held, res));
+        self.ready.insert(key, (held, credited, res));
     }
 
     /// Take the result for `key` if it has arrived.
     fn take(&mut self, key: Key) -> Option<Result<Unit>> {
-        let (held, res) = self.ready.take(&key)?;
+        let (held, credited, res) = self.ready.take(&key)?;
         self.used -= held;
+        self.credit_written += credited;
         self.outstanding -= 1;
         Some(res)
     }
@@ -956,6 +1103,7 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
                     unreachable!("the engine holds a sender")
                 }
             }
+            self.report_in_flight()?;
         }
     }
 
@@ -1005,11 +1153,7 @@ pub(crate) fn write_archive<W: Write + Seek>(
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }
-    let level = match effective_method(opts.method) {
-        Method::Store => None,
-        Method::Deflate { level } => Some(u32::from(level)),
-        _ => unreachable!("effective_method maps Phase 3 methods to Deflate for now"),
-    };
+    let codec = codec_for(opts.method);
     let threads = worker_count(opts.threads);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -1022,7 +1166,8 @@ pub(crate) fn write_archive<W: Write + Seek>(
         cancel,
         abort: AtomicBool::new(false),
         stop_after: AtomicUsize::new(usize::MAX),
-        level,
+        codec,
+        advanced: AtomicU64::new(0),
     };
     let (tx, rx) = mpsc::channel();
     let files_total = entries
@@ -1048,7 +1193,7 @@ pub(crate) fn write_archive<W: Write + Seek>(
             tx,
             rx,
             max_probes: threads.min(16),
-            budget: budget_for(threads),
+            budget: budget_with(threads, codec),
             used: 0,
             in_flight: 0,
             outstanding: 0,
@@ -1072,6 +1217,10 @@ pub(crate) fn write_archive<W: Write + Seek>(
             bytes_done: 0,
             bytes_total,
             last_report: 0,
+            last_report_at: Instant::now(),
+            seen_advanced: 0,
+            credit_written: 0,
+            shown: 0,
             files: 0,
             dirs: 0,
             symlinks: 0,
@@ -1103,6 +1252,35 @@ mod tests {
             effective_method(Method::Deflate { level: 200 }),
             Method::Deflate { level: 9 }
         );
+        for (given, used) in [(0, 1), (1, 1), (15, 15), (1000, 1000), (u16::MAX, 1000)] {
+            assert_eq!(
+                effective_method(Method::Zopfli { iterations: given }),
+                Method::Zopfli { iterations: used }
+            );
+        }
+        assert_eq!(codec_for(Method::Store), None);
+        assert_eq!(codec_for(Method::Deflate { level: 0 }), None);
+        assert_eq!(
+            codec_for(Method::Deflate { level: 1 }),
+            Some(Codec::Deflate(1))
+        );
+        assert_eq!(
+            codec_for(Method::Deflate { level: 8 }),
+            Some(Codec::Deflate(8))
+        );
+        assert_eq!(
+            codec_for(Method::Deflate { level: 9 }),
+            Some(Codec::Deflate(9))
+        );
+        assert_eq!(
+            codec_for(Method::Deflate { level: 42 }),
+            Some(Codec::Deflate(9))
+        );
+        assert_eq!(codec_for(Method::DeflateBest), Some(Codec::Best));
+        assert_eq!(
+            codec_for(Method::Zopfli { iterations: 0 }),
+            Some(Codec::Zopfli { iterations: 1 })
+        );
     }
 
     #[test]
@@ -1114,8 +1292,23 @@ mod tests {
         assert!(worker_count(0) >= 1);
         assert_eq!(worker_count(3), 3);
         // The largest unit always fits in the smallest budget.
-        assert!(unit_cost(BIG_FILE - 1, true) < budget_for(1));
-        assert!(unit_cost(CHUNK as u64, true) < budget_for(1));
+        let codecs = [
+            None,
+            Some(Codec::Deflate(1)),
+            Some(Codec::Best),
+            Some(Codec::Zopfli { iterations: 15 }),
+        ];
+        for c in codecs {
+            assert!(unit_cost(BIG_FILE - 1, c) < budget_with(1, c), "{c:?}");
+            assert!(unit_cost(CHUNK as u64, c) < budget_with(1, c), "{c:?}");
+            // Every worker can hold a chunk unit at once.
+            for t in [1, 8, 64] {
+                assert!(
+                    t as u64 * unit_cost(CHUNK as u64, c) <= budget_with(t, c),
+                    "{c:?} {t}"
+                );
+            }
+        }
     }
 
     #[test]

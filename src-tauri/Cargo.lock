@@ -5857,6 +5857,8 @@ dependencies = [
  "thiserror 2.0.17",
  "walkdir",
  "zip",
+ "zlib-rs",
+ "zopfli",
 ]
 
 [[package]]

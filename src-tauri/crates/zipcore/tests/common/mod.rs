@@ -985,3 +985,262 @@ pub fn size_rule_problems(entries: &[Entry]) -> Vec<String> {
     }
     v
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 helpers: independent deflate sizing, realistic text, method checks,
+// and extraction by external tools (unzip, bsdtar, ditto).
+// ---------------------------------------------------------------------------
+
+/// Raw deflate size of `data` at `level` with an independent encoder (flate2,
+/// zlib-rs backend, default strategy / window / memLevel).
+pub fn indep_deflate_len(data: &[u8], level: u32) -> usize {
+    use std::io::Write;
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+    e.write_all(data).unwrap();
+    e.finish().unwrap().len()
+}
+
+/// Smallest independent raw deflate over levels 6..=9.
+pub fn indep_best_6_to_9(data: &[u8]) -> usize {
+    (6..=9).map(|l| indep_deflate_len(data, l)).min().unwrap()
+}
+
+/// Deterministic pseudo-English text (words drawn from a small vocabulary with
+/// punctuation and line breaks): compressible like real prose, not a trivially
+/// repeating pattern.
+pub fn text_corpus(len: usize, seed: u64) -> Vec<u8> {
+    const WORDS: &[&str] = &[
+        "the",
+        "of",
+        "and",
+        "to",
+        "in",
+        "a",
+        "is",
+        "that",
+        "for",
+        "it",
+        "as",
+        "was",
+        "with",
+        "be",
+        "by",
+        "on",
+        "not",
+        "he",
+        "this",
+        "are",
+        "or",
+        "his",
+        "from",
+        "at",
+        "which",
+        "but",
+        "have",
+        "an",
+        "had",
+        "they",
+        "you",
+        "were",
+        "their",
+        "one",
+        "all",
+        "we",
+        "can",
+        "her",
+        "has",
+        "there",
+        "been",
+        "if",
+        "more",
+        "when",
+        "will",
+        "would",
+        "who",
+        "so",
+        "no",
+        "compression",
+        "archive",
+        "deflate",
+        "window",
+        "huffman",
+        "literal",
+        "distance",
+        "length",
+        "block",
+        "encoder",
+        "decoder",
+        "stream",
+        "header",
+        "central",
+        "directory",
+        "entry",
+        "file",
+        "folder",
+        "byte",
+        "table",
+        "symbol",
+        "match",
+        "lazy",
+        "greedy",
+        "optimal",
+        "parser",
+        "squeeze",
+        "iteration",
+        "probability",
+        "entropy",
+    ];
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let mut out = Vec::with_capacity(len + 32);
+    let mut col = 0usize;
+    let mut cap = true;
+    while out.len() < len {
+        let r = next();
+        let w = WORDS[(r % WORDS.len() as u64) as usize];
+        if cap {
+            let mut b = w.as_bytes().to_vec();
+            b[0] = b[0].to_ascii_uppercase();
+            out.extend_from_slice(&b);
+            cap = false;
+        } else {
+            out.extend_from_slice(w.as_bytes());
+        }
+        col += w.len() + 1;
+        match (r >> 32) % 23 {
+            0 => {
+                out.extend_from_slice(b". ");
+                cap = true;
+            }
+            1 => out.extend_from_slice(b", "),
+            2 => {
+                let n = (r >> 40) % 10_000;
+                out.extend_from_slice(format!(" {n} ").as_bytes());
+            }
+            _ => out.push(b' '),
+        }
+        if col > 72 {
+            out.push(b'\n');
+            col = 0;
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+/// Source-code-like bytes (repetitive structure with varying identifiers).
+pub fn source_like(len: usize, seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 128);
+    let mut i = seed;
+    while out.len() < len {
+        i = i.wrapping_add(1);
+        let name = format!("item_{}", i.wrapping_mul(2_654_435_761) % 997);
+        out.extend_from_slice(
+            format!(
+                "pub fn {name}(x: u32) -> u32 {{\n    // compute {name}\n    let y = x.wrapping_mul({});\n    if y > {} {{ y - 1 }} else {{ y + {} }}\n}}\n\n",
+                i % 31 + 1,
+                i % 1000,
+                i % 7
+            )
+            .as_bytes(),
+        );
+    }
+    out.truncate(len);
+    out
+}
+
+/// Every entry (central and local header) uses method 0 (Stored) or 8
+/// (Deflate): the product rule.
+pub fn assert_methods_store_or_deflate(bytes: &[u8], how: &str) {
+    let a = parse_raw_bytes(bytes);
+    for (cd, local) in &a.entries {
+        let name = String::from_utf8_lossy(&cd.name);
+        assert!(
+            cd.method == 0 || cd.method == 8,
+            "{how}: {name}: central method {} is not Stored/Deflate",
+            cd.method
+        );
+        assert_eq!(
+            cd.method, local.method,
+            "{how}: {name}: central/local method mismatch"
+        );
+    }
+}
+
+/// Builds an extraction command into the given directory.
+type ExtractCmd = Box<dyn Fn(&Path) -> Command>;
+
+/// Extract `zip_path` with every available external extractor (unzip, bsdtar,
+/// and ditto on macOS) into fresh directories and compare each result with
+/// the snapshot of `src_parent` (the directory containing the inputs).
+pub fn assert_external_extracts(zip_path: &Path, src_parent: &Path, work: &Path, test: &str) {
+    let expected = snapshot(src_parent);
+    let mut tools: Vec<(&str, ExtractCmd)> = Vec::new();
+    if let Some(u) = tool(&["unzip"], test) {
+        let zp = zip_path.to_path_buf();
+        tools.push((
+            "unzip",
+            Box::new(move |d: &Path| {
+                let mut c = Command::new(&u);
+                c.arg("-q").arg(&zp).arg("-d").arg(d);
+                c
+            }),
+        ));
+    }
+    if let Some(b) = tool(&["bsdtar"], test) {
+        let zp = zip_path.to_path_buf();
+        tools.push((
+            "bsdtar",
+            Box::new(move |d: &Path| {
+                let mut c = Command::new(&b);
+                c.arg("-xf").arg(&zp).arg("-C").arg(d);
+                c
+            }),
+        ));
+    }
+    if cfg!(target_os = "macos") {
+        if let Some(dt) = tool(&["ditto"], test) {
+            let zp = zip_path.to_path_buf();
+            tools.push((
+                "ditto",
+                Box::new(move |d: &Path| {
+                    let mut c = Command::new(&dt);
+                    c.arg("-x").arg("-k").arg(&zp).arg(d);
+                    c
+                }),
+            ));
+        }
+    }
+    for (i, (name, mk)) in tools.iter().enumerate() {
+        let dir = work.join(format!("x{i}_{name}"));
+        fs::create_dir_all(&dir).unwrap();
+        run_ok(&mut mk(&dir));
+        let got = snapshot(&dir);
+        let missing: Vec<_> = expected.keys().filter(|k| !got.contains_key(*k)).collect();
+        let extra: Vec<_> = got.keys().filter(|k| !expected.contains_key(*k)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "{test}: {name} extraction differs: missing {missing:?}, extra {extra:?}"
+        );
+        for (k, v) in &expected {
+            assert!(
+                got[k] == *v,
+                "{test}: {name} extracted {k:?} with different content"
+            );
+        }
+    }
+}
+
+/// Total compressed size of the file entries.
+pub fn total_compressed(entries: &[Entry]) -> u64 {
+    entries
+        .iter()
+        .filter(|e| !e.is_dir && !e.is_symlink)
+        .map(|e| e.compressed_size)
+        .sum()
+}

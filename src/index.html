@@ -27,15 +27,20 @@
       </div>
 
       <fieldset class="options">
-        <label class="field">
-          <span>Compression</span>
-          <select id="method">
-            <option value="store">Store (no compression)</option>
-            <option value="1">Fast</option>
-            <option value="6" selected>Balanced</option>
-            <option value="9">Best</option>
-          </select>
-        </label>
+        <div class="preset">
+          <label class="field">
+            <span>Compression</span>
+            <select id="preset" aria-describedby="preset-hint">
+              <option value="fast">Fast</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="best">Best</option>
+              <option value="max">Max (much slower)</option>
+              <option disabled>──────────</option>
+              <option value="store">Store (no compression)</option>
+            </select>
+          </label>
+          <p id="preset-hint" class="preset-hint"></p>
+        </div>
         <label class="check">
           <input id="exclude-junk" type="checkbox" checked />
           <span>Exclude system junk (.DS_Store, __MACOSX, Thumbs.db…)</span>
@@ -53,6 +58,7 @@
           <span id="progress-text"></span>
           <span id="progress-counts"></span>
         </div>
+        <div id="progress-time" class="progress-time" hidden></div>
         <div id="progress-current" class="current"></div>
       </section>
 

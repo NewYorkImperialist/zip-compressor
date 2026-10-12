@@ -1,9 +1,9 @@
 //! Phase 2 store-vs-deflate rules and the chunked (>= 4 MiB) deflate path.
 //!
 //! - < 4 MiB: deflate iff strictly smaller, else store (exact).
-//! - At or above 4 MiB: the first 1 MiB is probed; under 0.5% savings stores
-//!   the whole file, otherwise chunked deflate whose size is bounded by
-//!   `size + size/13000 + 64`.
+//! - At or above 4 MiB: the first 1 MiB is probed; under 0.1% savings
+//!   (levels 2-9 and Zopfli) or 0.5% (level 1) stores the whole file,
+//!   otherwise chunked deflate whose size is bounded by `size + size/13000 + 64`.
 
 mod common;
 
@@ -98,28 +98,116 @@ fn small_file_saving_a_few_bytes_is_deflated() {
     assert!(e.compressed_size <= e.size);
 }
 
-/// A >= 4 MiB file whose first MiB saves only ~0.3% is stored whole.
+/// Phase 3 probe thresholds: a >= 4 MiB file whose first MiB saves ~0.3% is
+/// Stored whole at level 1 (threshold 0.5%) but chunk-deflated at levels 6
+/// and 9 (threshold 0.1%), within the large-file size bound.
 #[test]
-fn large_file_with_weak_probe_is_stored() {
+fn large_file_with_point_three_percent_probe() {
     let td = tempfile::tempdir().unwrap();
     let f = td.path().join("video.mp4");
     let data = random_with_zeros(6 * MIB, 300_000, 3_300, 5);
-    let s = saving(&data[..MIB], 6);
+    for level in [6u32, 9] {
+        let s = saving(&data[..MIB], level);
+        assert!(
+            (0.0015..0.0045).contains(&s),
+            "test input broken: level {level} probe saving {s}"
+        );
+    }
     assert!(
-        (0.0015..0.0045).contains(&s),
-        "test input broken: probe saving {s}"
+        saving(&data[..MIB], 1) < 0.005,
+        "test input broken: level 1 probe saving"
     );
     write_file(&f, &data);
-    for threads in [1, 8] {
+    for (level, threads) in [(1u8, 1), (1, 8), (6, 1), (6, 8), (9, 3)] {
         let (zip, _) = compress_ok(
             std::slice::from_ref(&f),
-            &opts_t(Method::Deflate { level: 6 }, threads),
+            &opts_t(Method::Deflate { level }, threads),
         );
         let e = assert_one(&zip);
-        assert_eq!(e.method, CompressionMethod::Stored, "threads {threads}");
+        assert!(
+            e.data == data,
+            "level {level} threads {threads}: data differs"
+        );
+        if level == 1 {
+            assert_eq!(
+                e.method,
+                CompressionMethod::Stored,
+                "level 1 threads {threads}: ~0.3% probe saving must store (< 0.5%)"
+            );
+            assert_eq!(e.compressed_size, e.size);
+        } else {
+            assert_eq!(
+                e.method,
+                CompressionMethod::Deflated,
+                "level {level} threads {threads}: ~0.3% probe saving must deflate (>= 0.1%)"
+            );
+            assert!(
+                e.compressed_size <= large_bound(e.size),
+                "level {level} threads {threads}: {} -> {} exceeds bound {}",
+                e.size,
+                e.compressed_size,
+                large_bound(e.size)
+            );
+        }
+        assert!(size_rule_problems(std::slice::from_ref(&e)).is_empty());
+    }
+}
+
+/// A >= 4 MiB file whose first MiB saves only ~0.05% (below the 0.1%
+/// threshold at every level 6..=9) is Stored whole at levels 6 and 9.
+#[test]
+fn large_file_with_point_zero_five_percent_probe_is_stored() {
+    let td = tempfile::tempdir().unwrap();
+    let f = td.path().join("almost_random.bin");
+    let data = random_with_zeros(5 * MIB + 7, 200_000, 680, 21);
+    for level in [6u32, 7, 8, 9] {
+        let s = saving(&data[..MIB], level);
+        assert!(
+            (0.0001..0.0008).contains(&s),
+            "test input broken: level {level} probe saving {:.4}%",
+            s * 100.0
+        );
+    }
+    write_file(&f, &data);
+    for (level, threads) in [(6u8, 1), (6, 8), (9, 1), (9, 8), (1, 4)] {
+        let (zip, _) = compress_ok(
+            std::slice::from_ref(&f),
+            &opts_t(Method::Deflate { level }, threads),
+        );
+        let e = assert_one(&zip);
+        assert_eq!(
+            e.method,
+            CompressionMethod::Stored,
+            "level {level} threads {threads}: ~0.05% probe saving must store"
+        );
         assert_eq!(e.compressed_size, e.size);
         assert!(e.data == data);
     }
+}
+
+/// The same thresholds apply to Zopfli (0.1%). Release-only: Zopfli on a
+/// MiB of near-random data is slow in debug.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "zopfli is slow in debug; run with --release"
+)]
+fn zopfli_probe_thresholds() {
+    let td = tempfile::tempdir().unwrap();
+    let weak = td.path().join("weak.bin");
+    write_file(&weak, &random_with_zeros(5 * MIB, 200_000, 680, 21));
+    let ok = td.path().join("ok.bin");
+    let ok_data = random_with_zeros(6 * MIB, 300_000, 3_300, 5);
+    write_file(&ok, &ok_data);
+    let m = Method::Zopfli { iterations: 15 };
+    let (zip, _) = compress_ok(std::slice::from_ref(&weak), &opts_t(m, 8));
+    let e = assert_one(&zip);
+    assert_eq!(e.method, CompressionMethod::Stored, "zopfli ~0.05% probe");
+    let (zip, _) = compress_ok(std::slice::from_ref(&ok), &opts_t(m, 8));
+    let e = assert_one(&zip);
+    assert_eq!(e.method, CompressionMethod::Deflated, "zopfli ~0.3% probe");
+    assert!(e.compressed_size <= large_bound(e.size));
+    assert!(e.data == ok_data);
 }
 
 /// A >= 4 MiB file whose first MiB compresses well is chunk-deflated, and the

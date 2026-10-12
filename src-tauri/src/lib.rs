@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::State;
-use zipcore::{CompressOptions, Method, Progress, Summary, SymlinkPolicy};
+use zipcore::{CompressOptions, Method, Preset, Progress, Summary, SymlinkPolicy};
 
 /// Minimum spacing between progress events sent to the webview (~20/s).
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
@@ -20,7 +20,29 @@ struct AppState {
     busy: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PresetDto {
+    Fast,
+    Balanced,
+    Best,
+    Max,
+}
+
+impl From<PresetDto> for Preset {
+    fn from(p: PresetDto) -> Self {
+        match p {
+            PresetDto::Fast => Preset::Fast,
+            PresetDto::Balanced => Preset::Balanced,
+            PresetDto::Best => Preset::Best,
+            PresetDto::Max => Preset::Max,
+        }
+    }
+}
+
+/// Explicit method override, kept for older front ends. The UI sends `preset`
+/// (or `method: "store"` for no compression).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum MethodDto {
     Store,
@@ -37,10 +59,17 @@ enum SymlinksDto {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompressOptionsDto {
-    method: MethodDto,
-    /// Deflate level 0-9; defaults to 6. Ignored for `store`.
+    /// Named trade-off; the default when neither this nor `method` is given
+    /// is `balanced`. Cannot be combined with `method` or `level`.
+    #[serde(default)]
+    preset: Option<PresetDto>,
+    /// Advanced override: `store`, or `deflate` with `level`.
+    #[serde(default)]
+    method: Option<MethodDto>,
+    /// Deflate level 0-9 for `method: "deflate"`; defaults to 6.
+    #[serde(default)]
     level: Option<u8>,
     #[serde(default)]
     symlinks: SymlinksDto,
@@ -54,15 +83,27 @@ fn default_true() -> bool {
 
 impl CompressOptionsDto {
     fn into_options(self) -> Result<CompressOptions, String> {
-        let method = match self.method {
-            MethodDto::Store => Method::Store,
-            MethodDto::Deflate => {
-                let level = self.level.unwrap_or(6);
+        let method = match (self.preset, self.method, self.level) {
+            (Some(_), Some(_), _) => {
+                return Err("pass either `preset` or `method`, not both".into());
+            }
+            (Some(_), None, Some(_)) => {
+                return Err("`level` cannot be combined with `preset`".into());
+            }
+            (Some(p), None, None) => Preset::from(p).method(),
+            // Older front ends sent a (null or ignored) level with store.
+            (None, Some(MethodDto::Store), _) => Method::Store,
+            (None, Some(MethodDto::Deflate), level) => {
+                let level = level.unwrap_or(6);
                 if level > 9 {
                     return Err(format!("invalid deflate level {level} (expected 0-9)"));
                 }
                 Method::Deflate { level }
             }
+            (None, None, Some(_)) => {
+                return Err("`level` requires `method: \"deflate\"`".into());
+            }
+            (None, None, None) => Preset::default().method(),
         };
         let symlinks = match self.symlinks {
             SymlinksDto::Store => SymlinkPolicy::Store,
@@ -204,4 +245,53 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![compress, cancel])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn method_of(json: &str) -> Result<Method, String> {
+        let dto: CompressOptionsDto = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        dto.into_options().map(|o| o.method)
+    }
+
+    #[test]
+    fn presets_map_to_engine_methods() {
+        for p in Preset::ALL {
+            let json = format!(r#"{{"preset":"{}"}}"#, p.name());
+            assert_eq!(method_of(&json), Ok(p.method()));
+        }
+    }
+
+    #[test]
+    fn default_is_balanced() {
+        assert_eq!(method_of("{}"), Ok(Preset::Balanced.method()));
+    }
+
+    #[test]
+    fn legacy_method_and_level_still_work() {
+        assert_eq!(
+            method_of(r#"{"method":"deflate","level":3}"#),
+            Ok(Method::Deflate { level: 3 })
+        );
+        assert_eq!(
+            method_of(r#"{"method":"store","level":null,"symlinks":"store","excludeJunk":true}"#),
+            Ok(Method::Store)
+        );
+    }
+
+    #[test]
+    fn invalid_combinations_are_rejected() {
+        for json in [
+            r#"{"preset":"max","method":"store"}"#,
+            r#"{"preset":"best","level":9}"#,
+            r#"{"level":4}"#,
+            r#"{"method":"deflate","level":10}"#,
+            r#"{"preset":"ultra"}"#,
+            r#"{"prest":"max"}"#,
+        ] {
+            assert!(method_of(json).is_err(), "accepted {json}");
+        }
+    }
 }

@@ -12,8 +12,12 @@ license = "MIT"
 zip.workspace = true
 walkdir.workspace = true
 thiserror.workspace = true
-# Raw deflate (zlib-rs backend; `any_zlib` gives `set_dictionary` for chunked deflate).
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Raw deflate and inflate (src/zlib.rs). Used directly rather than through
+# flate2 for the encoder settings flate2 does not expose (the strategy); the
+# same version flate2's zlib-rs backend uses, so the bytes are the same.
+zlib-rs = { version = "0.5.5", default-features = false, features = ["std"] }
+# Zopfli deflate (Method::Zopfli, src/zopfli_codec.rs). Raw deflate only.
+zopfli = { version = "0.8.4", default-features = false, features = ["std"] }
 # Worker pool with scoped tasks (workers borrow the scanned entries; the scope
 # joins every task before `compress` returns).
 rayon = "1"

@@ -157,7 +157,14 @@ fn cancel_while_chunked_file_in_flight() {
 fn cancel_from_another_thread() {
     let td = tempfile::tempdir().unwrap();
     let root = td.path().join("ext");
-    write_file(&root.join("big.bin"), &periodic(48 * MIB, 5_003, 2));
+    // Release builds compress this periodic data at hundreds of MB/s, so
+    // they get more input and an earlier cancel.
+    let (big, delay_ms) = if cfg!(debug_assertions) {
+        (48 * MIB, 300)
+    } else {
+        (160 * MIB, 25)
+    };
+    write_file(&root.join("big.bin"), &periodic(big, 5_003, 2));
     many_files(&root.join("more"), 100);
     let out_dir = td.path().join("out");
     fs::create_dir(&out_dir).unwrap();
@@ -166,7 +173,7 @@ fn cancel_from_another_thread() {
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let c2 = cancel.clone();
         let t = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(delay_ms));
             c2.store(true, Ordering::SeqCst);
         });
         let r = zipcore::compress_to_path(
@@ -179,7 +186,7 @@ fn cancel_from_another_thread() {
         t.join().unwrap();
         r
     });
-    let err = res.expect_err("run finished before a 300 ms cancel? input too small");
+    let err = res.expect_err("run finished before the cancel? input too small");
     assert!(matches!(err, Error::Cancelled), "got {err:?}");
     assert!(
         list_dir(&out_dir).is_empty(),
