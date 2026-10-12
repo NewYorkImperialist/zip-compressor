@@ -547,7 +547,14 @@ mod tests {
             assert_eq!(u16_at(&b, 4), (3 << 8) | 63, "made by Unix");
             assert_eq!(ext >> 16, 0o040755, "dir type + permission bits only");
         }
-        assert_eq!(ext & 0xff, 0x10, "DOS directory bit");
+        assert_eq!(ext & DOS_DIR_ATTR, DOS_DIR_ATTR, "DOS directory bit");
+        if HOST == Host::Dos {
+            // `mode` holds FILE_ATTRIBUTE_* here: 0o104755 has read-only,
+            // system and archive set; read-only is dropped for directories.
+            assert_eq!(ext, DOS_SYSTEM | DOS_ARCHIVE | DOS_DIR_ATTR);
+        } else {
+            assert_eq!(ext & 0xff, DOS_DIR_ATTR, "no other DOS bits");
+        }
         assert_eq!(u32_at(&b, 42), 99);
         assert_eq!(central_zip64_fields(&b), None);
     }
