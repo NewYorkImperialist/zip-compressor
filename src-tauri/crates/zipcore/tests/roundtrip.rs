@@ -188,16 +188,53 @@ fn duplicate_top_level_names_are_rejected() {
     let b = td.path().join("b/same");
     write_file(&a.join("1.txt"), b"1");
     write_file(&b.join("2.txt"), b"2");
-    let r = compress_mem(&[a.clone(), b], &opts(DEFLATE));
-    assert!(r.is_err(), "two inputs both named `same` must be an error");
+    let assert_dup = |inputs: &[PathBuf], what: &str| match compress_mem(inputs, &opts(DEFLATE)) {
+        Err(zipcore::Error::DuplicateName(n)) => {
+            assert_eq!(n, "same", "{what}: DuplicateName carries the wrong name")
+        }
+        Err(e) => panic!("{what}: expected Error::DuplicateName(\"same\"), got {e:?}"),
+        Ok(_) => panic!("{what}: duplicate top-level names must be an error"),
+    };
+    assert_dup(&[a.clone(), b.clone()], "two dirs both named `same`");
 
     // A file and a directory with the same name collide too.
     let c = td.path().join("c/same");
     write_file(&c, b"file");
-    assert!(compress_mem(&[a.clone(), c], &opts(DEFLATE)).is_err());
+    assert_dup(&[a.clone(), c.clone()], "dir and file named `same`");
+    assert_dup(&[c.clone(), a.clone()], "file and dir named `same`");
 
     // The same input twice is also a duplicate.
-    assert!(compress_mem(&[a.clone(), a], &opts(DEFLATE)).is_err());
+    assert_dup(&[a.clone(), a.clone()], "same input twice");
+
+    // Not adjacent: a third, distinct input in between.
+    let other = td.path().join("other.txt");
+    write_file(&other, b"o");
+    assert_dup(
+        &[a.clone(), other, b],
+        "duplicates separated by another input",
+    );
+
+    // compress_to_path reports the same error and leaves nothing behind.
+    let out_dir = td.path().join("out");
+    fs::create_dir(&out_dir).unwrap();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let err = zipcore::compress_to_path(
+        &[a, c],
+        &out_dir.join("x.zip"),
+        &opts(DEFLATE),
+        &mut |_| {},
+        &cancel,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, zipcore::Error::DuplicateName(ref n) if n == "same"),
+        "got {err:?}"
+    );
+    assert!(
+        list_dir(&out_dir).is_empty(),
+        "leftovers: {:?}",
+        list_dir(&out_dir)
+    );
 }
 
 #[test]
@@ -274,13 +311,20 @@ fn incompressible_data_never_grows() {
     write_file(&root.join("tiny.rnd"), &random_bytes(1, 4));
     write_file(&root.join("empty"), b"");
     write_file(&root.join("text.txt"), &compressible_bytes(5000));
+    // >= 4 MiB: chunked path, bounded rather than strict.
+    write_file(&root.join("huge.rnd"), &random_bytes(5 * MIB + 1, 98));
+    let mut tail_rnd = compressible_bytes(MIB);
+    tail_rnd.extend(random_bytes(4 * MIB, 97));
+    write_file(&root.join("tail.rnd"), &tail_rnd);
     for level in [1u8, 6, 9] {
         let (zip, _) = compress_ok(
             std::slice::from_ref(&root),
             &opts(Method::Deflate { level }),
         );
         let entries = read_entries(&zip);
-        for e in &entries {
+        let bad = size_rule_problems(&entries);
+        assert!(bad.is_empty(), "level {level}: {bad:?}");
+        for e in entries.iter().filter(|e| e.size < 4 * MIB as u64) {
             assert!(
                 e.compressed_size <= e.size,
                 "level {level}: entry {} grew: {} -> {} ({:?})",
@@ -323,6 +367,11 @@ fn large_file_streams_and_round_trips() {
     let entries = read_entries(&zip);
     assert_eq!(entries.len(), 1);
     assert!(entries[0].data == data, "large file contents differ");
+    // First MiB is random: the probe stores the whole file.
+    assert_eq!(entries[0].method, CompressionMethod::Stored);
+    let bad = size_rule_problems(&entries);
+    assert!(bad.is_empty(), "{bad:?}");
+    assert_layout(&zip, "large file");
     assert_eq!(summary.bytes_in, data.len() as u64);
 
     // "periodically while large files stream": more than one distinct
@@ -451,23 +500,59 @@ fn local_headers_match_central_directory() {
             .iter()
             .map(|(n, _)| String::from_utf8_lossy(n).into_owned())
             .collect();
-        (s_names != central)
-            .then(|| format!("{how}: local headers {s_names:?} != central directory {central:?}"))
+        if s_names != central {
+            return Some(format!(
+                "{how}: local headers {s_names:?} != central directory {central:?}"
+            ));
+        }
+        let raw = std::panic::catch_unwind(|| layout_problems(&parse_raw_bytes(zip)));
+        match raw {
+            Ok(p) if p.is_empty() => None,
+            Ok(p) => Some(format!("{how}: {}", p.join("; "))),
+            Err(_) => Some(format!("{how}: raw parse panicked")),
+        }
     };
     // A lone, just-under-1 MiB incompressible file with a one-letter name: the
     // abandoned deflate attempt overshoots the stored size by more than the
     // tiny central directory, so a rewinding writer leaves slack at the end.
     let lone = td.path().join("z");
     write_file(&lone, &random_bytes(1_000_000, 77));
+    // A lone large file on the chunked path (> 4 MiB, not a multiple of 1 MiB).
+    let large = td.path().join("large.txt");
+    write_file(&large, &compressible_bytes(5 * MIB + 333));
+    // Mixed: small files, a chunked file with incompressible chunks, a large
+    // file the probe stores, and small files after them.
+    let mixed = td.path().join("mixed");
+    write_file(&mixed.join("a.txt"), &compressible_bytes(1000));
+    let mut half = compressible_bytes(MIB);
+    half.extend(random_bytes(3 * MIB + 17, 5));
+    write_file(&mixed.join("b_chunked.bin"), &half);
+    write_file(&mixed.join("c_stored.bin"), &random_bytes(4 * MIB + 1, 6));
+    write_file(&mixed.join("d_text.txt"), &compressible_bytes(6 * MIB));
+    write_file(&mixed.join("e_small_rnd.bin"), &random_bytes(999, 7));
+    write_file(&mixed.join("f/g.txt"), b"g");
     let mut problems = Vec::new();
     for method in [
         DEFLATE,
         Method::Deflate { level: 1 },
         Method::Deflate { level: 9 },
     ] {
-        for (label, input) in [("tree", &root), ("lone file", &lone)] {
+        for (label, input) in [
+            ("tree", &root),
+            ("lone file", &lone),
+            ("large file", &large),
+            ("mixed", &mixed),
+        ] {
+            if label != "tree" && label != "lone file" && method == (Method::Deflate { level: 9 }) {
+                continue; // time budget: large inputs at levels 6 and 1 only
+            }
             let (zip, _) = compress_ok(std::slice::from_ref(input), &opts(method));
             problems.extend(check(&zip, format!("compress() {label} {method:?}")));
+            let (zip8, _) = compress_ok(std::slice::from_ref(input), &opts_t(method, 8));
+            problems.extend(check(
+                &zip8,
+                format!("compress() threads=8 {label} {method:?}"),
+            ));
 
             let out = td.path().join("streamcheck.zip");
             let cancel = std::sync::atomic::AtomicBool::new(false);

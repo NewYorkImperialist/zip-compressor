@@ -466,3 +466,522 @@ pub fn stream_entries(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 helpers: thread options, path output, timeouts, external validators,
+// and an independent raw ZIP structure parser.
+// ---------------------------------------------------------------------------
+
+pub const MIB: usize = 1 << 20;
+
+/// Options with the given method and thread count, defaults otherwise.
+pub fn opts_t(method: Method, threads: usize) -> CompressOptions {
+    CompressOptions {
+        method,
+        threads,
+        ..CompressOptions::default()
+    }
+}
+
+/// `compress_to_path` into `out`, returning the archive bytes. Panics on error.
+pub fn compress_path_ok(
+    inputs: &[PathBuf],
+    out: &Path,
+    opts: &CompressOptions,
+) -> (Vec<u8>, Summary) {
+    let cancel = AtomicBool::new(false);
+    let summary = zipcore::compress_to_path(inputs, out, opts, &mut |_| {}, &cancel)
+        .unwrap_or_else(|e| panic!("compress_to_path failed for {inputs:?}: {e:?}"));
+    let bytes = fs::read(out).unwrap();
+    assert_eq!(summary.bytes_out, bytes.len() as u64, "Summary.bytes_out");
+    (bytes, summary)
+}
+
+/// Run `f` on a thread and fail if it does not finish within `secs`.
+pub fn with_timeout<T: Send + 'static>(
+    secs: u64,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{what}: did not finish within {secs}s (hang/deadlock?)")
+        }
+        Err(e) => panic!("{what}: worker thread died (panicked?): {e}"),
+    }
+}
+
+/// `unzip -t` and Python `zipfile.testzip()` over an archive file, each skipped
+/// with a note when the tool is missing. `expected_entries` is checked against
+/// Python's entry count.
+pub fn external_validate(zip_path: &Path, expected_entries: usize, test: &str) {
+    if let Some(unzip) = tool(&["unzip"], test) {
+        run_ok(Command::new(unzip).arg("-tq").arg(zip_path));
+    }
+    if let Some(py) = python(test) {
+        let out = run_python(
+            &py,
+            "import zipfile\nwith zipfile.ZipFile(sys.argv[1]) as z:\n    print(len(z.infolist()), z.testzip())\n",
+            &[zip_path],
+        );
+        assert_eq!(
+            out.trim(),
+            format!("{expected_entries} None"),
+            "python zipfile on {zip_path:?}"
+        );
+    }
+}
+
+/// Streaming reader (local headers only) must see exactly the central
+/// directory's entries, in order, with identical contents.
+pub fn assert_stream_matches(bytes: &[u8], entries: &[Entry], how: &str) {
+    let streamed = stream_entries(bytes);
+    let s_names: Vec<String> = streamed
+        .iter()
+        .map(|(n, _)| String::from_utf8_lossy(n).into_owned())
+        .collect();
+    assert_eq!(
+        s_names,
+        names(entries),
+        "{how}: streamed names != central directory"
+    );
+    for ((n, d), e) in streamed.iter().zip(entries) {
+        if !e.is_dir {
+            assert!(
+                *d == e.data,
+                "{how}: streamed data of {:?} differs ({} vs {} bytes)",
+                String::from_utf8_lossy(n),
+                d.len(),
+                e.data.len()
+            );
+        }
+    }
+}
+
+/// One central directory record with ZIP64 values resolved.
+#[derive(Debug, Clone)]
+pub struct RawCd {
+    pub version_needed: u16,
+    pub flags: u16,
+    pub method: u16,
+    pub time: u16,
+    pub date: u16,
+    pub crc: u32,
+    pub csize: u64,
+    pub usize: u64,
+    pub offset: u64,
+    pub name: Vec<u8>,
+    pub extra: Vec<u8>,
+    pub comment_len: u16,
+}
+
+/// One local file header with ZIP64 values resolved.
+#[derive(Debug, Clone)]
+pub struct RawLocal {
+    pub flags: u16,
+    pub method: u16,
+    pub time: u16,
+    pub date: u16,
+    pub crc: u32,
+    pub csize: u64,
+    pub usize: u64,
+    pub name: Vec<u8>,
+    pub extra: Vec<u8>,
+    /// Length of header + name + extra.
+    pub header_len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawArchive {
+    pub len: u64,
+    pub comment: Vec<u8>,
+    pub cd_offset: u64,
+    pub cd_size: u64,
+    /// Entry count from the (ZIP64, if present) end of central directory.
+    pub total_entries: u64,
+    /// 16-bit entry count in the classic EOCD record.
+    pub eocd_entries16: u16,
+    pub has_zip64_eocd: bool,
+    /// Where the end records begin (ZIP64 EOCD if present, else EOCD).
+    pub end_records_at: u64,
+    pub entries: Vec<(RawCd, RawLocal)>,
+}
+
+fn u16le(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+fn u32le(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+fn u64le(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+fn read_at<R: std::io::Read + std::io::Seek>(r: &mut R, at: u64, len: usize) -> Vec<u8> {
+    use std::io::SeekFrom;
+    r.seek(SeekFrom::Start(at)).unwrap();
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)
+        .unwrap_or_else(|e| panic!("raw read of {len} bytes at {at} failed: {e}"));
+    buf
+}
+
+/// Find the body of extra field `id`.
+pub fn extra_field(extra: &[u8], id: u16) -> Option<&[u8]> {
+    let mut i = 0;
+    while i + 4 <= extra.len() {
+        let hid = u16le(extra, i);
+        let len = u16le(extra, i + 2) as usize;
+        let end = (i + 4 + len).min(extra.len());
+        if hid == id {
+            return Some(&extra[i + 4..end]);
+        }
+        i += 4 + len;
+    }
+    None
+}
+
+/// Parse an archive from scratch (EOCD, ZIP64 EOCD, central directory, and
+/// every local header), independently of the zip crate.
+pub fn parse_raw<R: std::io::Read + std::io::Seek>(r: &mut R) -> RawArchive {
+    use std::io::SeekFrom;
+    let len = r.seek(SeekFrom::End(0)).unwrap();
+    assert!(len >= 22, "archive too short ({len} bytes)");
+    let tail_len = len.min(22 + 65535) as usize;
+    let tail_start = len - tail_len as u64;
+    let tail = read_at(r, tail_start, tail_len);
+    let mut eocd_rel = None;
+    for i in (0..=tail_len - 22).rev() {
+        if tail[i..i + 4] == *b"PK\x05\x06" {
+            let clen = u16le(&tail, i + 20) as usize;
+            if i + 22 + clen == tail_len {
+                eocd_rel = Some(i);
+                break;
+            }
+        }
+    }
+    let er = eocd_rel.expect("no end-of-central-directory record ending exactly at EOF");
+    let eocd_pos = tail_start + er as u64;
+    let e = &tail[er..];
+    let entries16 = u16le(e, 10);
+    let mut total = entries16 as u64;
+    let mut cd_size = u32le(e, 12) as u64;
+    let mut cd_offset = u32le(e, 16) as u64;
+    let comment = e[22..22 + u16le(e, 20) as usize].to_vec();
+    let mut has_zip64 = false;
+    let mut end_records_at = eocd_pos;
+    if eocd_pos >= 20 {
+        let loc = read_at(r, eocd_pos - 20, 20);
+        if loc[0..4] == *b"PK\x06\x07" {
+            let z64_pos = u64le(&loc, 8);
+            let z = read_at(r, z64_pos, 56);
+            assert_eq!(
+                &z[0..4],
+                b"PK\x06\x06",
+                "ZIP64 locator points at a non-ZIP64-EOCD"
+            );
+            let rec_size = u64le(&z, 4);
+            assert_eq!(
+                z64_pos + 12 + rec_size,
+                eocd_pos - 20,
+                "ZIP64 EOCD record does not end at the locator"
+            );
+            has_zip64 = true;
+            end_records_at = z64_pos;
+            total = u64le(&z, 32);
+            assert_eq!(u64le(&z, 24), total, "ZIP64 EOCD: entries on disk != total");
+            cd_size = u64le(&z, 40);
+            cd_offset = u64le(&z, 48);
+        }
+    }
+    if !has_zip64 {
+        assert!(
+            entries16 != 0xFFFF && cd_size != 0xFFFF_FFFF && cd_offset != 0xFFFF_FFFF,
+            "EOCD has ZIP64 sentinels but there is no ZIP64 locator"
+        );
+    }
+    assert_eq!(
+        cd_offset + cd_size,
+        end_records_at,
+        "central directory does not end where the end records begin"
+    );
+
+    let cd = read_at(r, cd_offset, cd_size as usize);
+    let mut p = 0usize;
+    let mut entries = Vec::new();
+    for idx in 0..total {
+        assert!(
+            p + 46 <= cd.len(),
+            "central directory truncated at entry {idx}"
+        );
+        assert_eq!(
+            &cd[p..p + 4],
+            b"PK\x01\x02",
+            "bad CD signature at entry {idx}"
+        );
+        let nlen = u16le(&cd, p + 28) as usize;
+        let xlen = u16le(&cd, p + 30) as usize;
+        let clen = u16le(&cd, p + 32);
+        let name = cd[p + 46..p + 46 + nlen].to_vec();
+        let extra = cd[p + 46 + nlen..p + 46 + nlen + xlen].to_vec();
+        let mut usize_ = u32le(&cd, p + 24) as u64;
+        let mut csize = u32le(&cd, p + 20) as u64;
+        let mut offset = u32le(&cd, p + 42) as u64;
+        let any_sentinel = usize_ == 0xFFFF_FFFF || csize == 0xFFFF_FFFF || offset == 0xFFFF_FFFF;
+        if any_sentinel {
+            let z = extra_field(&extra, 0x0001).unwrap_or_else(|| {
+                panic!(
+                    "CD entry {:?} has 0xFFFFFFFF fields but no ZIP64 extra",
+                    String::from_utf8_lossy(&name)
+                )
+            });
+            let mut q = 0;
+            for v in [&mut usize_, &mut csize, &mut offset] {
+                if *v == 0xFFFF_FFFF {
+                    assert!(
+                        q + 8 <= z.len(),
+                        "ZIP64 extra of {:?} too short",
+                        String::from_utf8_lossy(&name)
+                    );
+                    *v = u64le(z, q);
+                    q += 8;
+                }
+            }
+        }
+        let c = RawCd {
+            version_needed: u16le(&cd, p + 6),
+            flags: u16le(&cd, p + 8),
+            method: u16le(&cd, p + 10),
+            time: u16le(&cd, p + 12),
+            date: u16le(&cd, p + 14),
+            crc: u32le(&cd, p + 16),
+            csize,
+            usize: usize_,
+            offset,
+            name,
+            extra,
+            comment_len: clen,
+        };
+        p += 46 + nlen + xlen + clen as usize;
+
+        let h = read_at(r, c.offset, 30);
+        assert_eq!(
+            &h[0..4],
+            b"PK\x03\x04",
+            "no local header at the offset of {:?}",
+            String::from_utf8_lossy(&c.name)
+        );
+        let lnlen = u16le(&h, 26) as usize;
+        let lxlen = u16le(&h, 28) as usize;
+        let ne = read_at(r, c.offset + 30, lnlen + lxlen);
+        let lname = ne[..lnlen].to_vec();
+        let lextra = ne[lnlen..].to_vec();
+        let mut lc = u32le(&h, 18) as u64;
+        let mut lu = u32le(&h, 22) as u64;
+        if lc == 0xFFFF_FFFF || lu == 0xFFFF_FFFF {
+            let z = extra_field(&lextra, 0x0001).unwrap_or_else(|| {
+                panic!(
+                    "local header of {:?} has 0xFFFFFFFF sizes but no ZIP64 extra",
+                    String::from_utf8_lossy(&lname)
+                )
+            });
+            if z.len() >= 16 {
+                if lu == 0xFFFF_FFFF {
+                    lu = u64le(z, 0);
+                }
+                if lc == 0xFFFF_FFFF {
+                    lc = u64le(z, 8);
+                }
+            } else {
+                assert!(z.len() >= 8, "local ZIP64 extra too short");
+                if lu == 0xFFFF_FFFF {
+                    lu = u64le(z, 0);
+                } else {
+                    lc = u64le(z, 0);
+                }
+            }
+        }
+        let l = RawLocal {
+            flags: u16le(&h, 6),
+            method: u16le(&h, 8),
+            time: u16le(&h, 10),
+            date: u16le(&h, 12),
+            crc: u32le(&h, 14),
+            csize: lc,
+            usize: lu,
+            name: lname,
+            extra: lextra,
+            header_len: (30 + lnlen + lxlen) as u64,
+        };
+        entries.push((c, l));
+    }
+    assert_eq!(
+        p as u64, cd_size,
+        "CD records do not fill the CD size exactly"
+    );
+    RawArchive {
+        len,
+        comment,
+        cd_offset,
+        cd_size,
+        total_entries: total,
+        eocd_entries16: entries16,
+        has_zip64_eocd: has_zip64,
+        end_records_at,
+        entries,
+    }
+}
+
+pub fn parse_raw_bytes(bytes: &[u8]) -> RawArchive {
+    parse_raw(&mut Cursor::new(bytes))
+}
+
+/// Every structural invariant the Phase 2 writer promises, as a list of
+/// problems (empty = fine):
+/// - empty archive comment;
+/// - each local header agrees with its CD record (name, method, flags, CRC,
+///   sizes, time/date), and general-purpose bit 3 (data descriptor) is clear;
+/// - stored entries have compressed == uncompressed size;
+/// - local entries tile the file from offset 0 to the central directory with
+///   no gaps, overlaps or unlisted bytes.
+pub fn layout_problems(a: &RawArchive) -> Vec<String> {
+    let mut probs = Vec::new();
+    if !a.comment.is_empty() {
+        probs.push(format!(
+            "archive comment is not empty: {:?}",
+            String::from_utf8_lossy(&a.comment)
+        ));
+    }
+    if a.total_entries != a.entries.len() as u64 {
+        probs.push("entry count mismatch".into());
+    }
+    let mut spans = Vec::new();
+    for (c, l) in &a.entries {
+        let n = String::from_utf8_lossy(&c.name).into_owned();
+        if c.name != l.name {
+            probs.push(format!(
+                "{n}: local name {:?} != CD name",
+                String::from_utf8_lossy(&l.name)
+            ));
+        }
+        if c.method != l.method {
+            probs.push(format!("{n}: method local {} != CD {}", l.method, c.method));
+        }
+        if c.flags != l.flags {
+            probs.push(format!(
+                "{n}: flags local {:#06x} != CD {:#06x}",
+                l.flags, c.flags
+            ));
+        }
+        if c.flags & 0x0008 != 0 || l.flags & 0x0008 != 0 {
+            probs.push(format!("{n}: data-descriptor flag (bit 3) is set"));
+        }
+        if c.flags & 0x0001 != 0 {
+            probs.push(format!("{n}: encrypted flag set"));
+        }
+        if c.crc != l.crc {
+            probs.push(format!("{n}: CRC local {:08x} != CD {:08x}", l.crc, c.crc));
+        }
+        if c.csize != l.csize || c.usize != l.usize {
+            probs.push(format!(
+                "{n}: sizes local {}/{} != CD {}/{} (compressed/uncompressed)",
+                l.csize, l.usize, c.csize, c.usize
+            ));
+        }
+        if (c.time, c.date) != (l.time, l.date) {
+            probs.push(format!("{n}: DOS time/date local != CD"));
+        }
+        if c.method == 0 && c.csize != c.usize {
+            probs.push(format!(
+                "{n}: stored but compressed {} != size {}",
+                c.csize, c.usize
+            ));
+        }
+        if c.method != 0 && c.method != 8 {
+            probs.push(format!("{n}: unexpected method {}", c.method));
+        }
+        if c.comment_len != 0 {
+            probs.push(format!("{n}: has an entry comment"));
+        }
+        if c.name.ends_with(b"/") && (c.usize != 0 || c.csize != 0) {
+            probs.push(format!("{n}: directory entry with data"));
+        }
+        spans.push((c.offset, c.offset + l.header_len + c.csize, n));
+    }
+    spans.sort();
+    let mut pos = 0u64;
+    for (start, end, n) in &spans {
+        if *start != pos {
+            probs.push(format!(
+                "{n}: local header at {start}, but previous entry ended at {pos} ({} unlisted/overlapping bytes)",
+                *start as i64 - pos as i64
+            ));
+        }
+        pos = *end;
+    }
+    if pos != a.cd_offset {
+        probs.push(format!(
+            "last entry ends at {pos} but the central directory starts at {}",
+            a.cd_offset
+        ));
+    }
+    probs
+}
+
+pub fn assert_layout(bytes: &[u8], how: &str) -> RawArchive {
+    let a = parse_raw_bytes(bytes);
+    let p = layout_problems(&a);
+    assert!(
+        p.is_empty(),
+        "{how}: layout problems:\n  {}",
+        p.join("\n  ")
+    );
+    a
+}
+
+/// Full in-process verification: zip crate read (CRC-checked) matches the
+/// expected tree, streaming reader agrees, and the raw layout is sound.
+pub fn verify_archive(bytes: &[u8], expected: &BTreeMap<String, Node>, how: &str) -> Vec<Entry> {
+    let entries = read_entries(bytes);
+    assert_safe_names(&entries);
+    assert_nodes_eq(&archive_nodes(&entries), expected);
+    assert_stream_matches(bytes, &entries, how);
+    assert_layout(bytes, how);
+    entries
+}
+
+/// Upper bound on the compressed size of a >= 4 MiB entry under the spec.
+pub fn large_bound(size: u64) -> u64 {
+    size + size / 13000 + 64
+}
+
+/// The engine's store-vs-deflate rule, checked per entry:
+/// < 4 MiB: compressed < size when deflated, == size when stored;
+/// >= 4 MiB: within [`large_bound`].
+pub fn size_rule_problems(entries: &[Entry]) -> Vec<String> {
+    let mut v = Vec::new();
+    for e in entries.iter().filter(|e| !e.is_dir && !e.is_symlink) {
+        let ok = if e.size < 4 * MIB as u64 {
+            match e.method {
+                CompressionMethod::Stored => e.compressed_size == e.size,
+                CompressionMethod::Deflated => e.compressed_size < e.size,
+                _ => false,
+            }
+        } else {
+            e.compressed_size <= large_bound(e.size)
+                && (e.method != CompressionMethod::Stored || e.compressed_size == e.size)
+        };
+        if !ok {
+            v.push(format!(
+                "{}: {} -> {} ({:?})",
+                e.name, e.size, e.compressed_size, e.method
+            ));
+        }
+    }
+    v
+}

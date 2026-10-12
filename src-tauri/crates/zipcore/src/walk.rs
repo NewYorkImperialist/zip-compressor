@@ -1,7 +1,7 @@
 //! Pre-scan of the inputs: turns the input list into a flat, sorted list of
 //! archive entries (with sizes, so progress totals are known up front).
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -144,7 +144,7 @@ pub(crate) fn scan(
     cancel: &AtomicBool,
 ) -> Result<Vec<Entry>> {
     let follow = follow_links(opts.symlinks);
-    let mut seen: HashMap<String, PathBuf> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut entries = Vec::new();
 
     for input in inputs {
@@ -165,19 +165,9 @@ pub(crate) fn scan(
         }
 
         let top = top_level_name(input)?;
-        if let Some(prev) = seen.get(&top) {
-            return Err(Error::Io {
-                path: input.clone(),
-                source: io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "two inputs would both be stored as `{top}` in the archive (the other is {})",
-                        prev.display()
-                    ),
-                ),
-            });
+        if !seen.insert(top.clone()) {
+            return Err(Error::DuplicateName(top));
         }
-        seen.insert(top.clone(), input.clone());
 
         let exclude_junk = opts.exclude_junk;
         let walker = WalkDir::new(input)

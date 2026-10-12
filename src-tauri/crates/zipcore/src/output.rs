@@ -78,16 +78,7 @@ pub(crate) fn compress_to_path(
         .map_err(|e| io_err(&tmp, e))?;
 
     let result = (|| -> Result<Summary> {
-        let truncate = |f: &File, len: u64| f.set_len(len);
-        let written = writer::write_archive(
-            &entries,
-            file,
-            opts,
-            progress,
-            cancel,
-            &tmp,
-            Some(&truncate),
-        )?;
+        let written = writer::write_archive(&entries, file, opts, progress, cancel, &tmp)?;
         let file: File = written.inner;
         file.sync_all().map_err(|e| io_err(&tmp, e))?;
         drop(file);

@@ -121,12 +121,20 @@ pub(crate) fn clamp_to_dos_range(c: Civil) -> Civil {
     }
 }
 
-/// DOS date/time (local wall clock, clamped) for a modification time.
-pub(crate) fn dos_datetime(mtime: SystemTime) -> zip::DateTime {
-    let c = clamp_to_dos_range(civil_from_unix_local(unix_secs(mtime)));
-    // In range after clamping; the zip crate rounds odd seconds down.
-    zip::DateTime::from_date_and_time(c.year as u16, c.month, c.day, c.hour, c.minute, c.second)
-        .unwrap_or_default()
+/// DOS `(time, date)` fields (local wall clock, clamped, 2-second resolution)
+/// for a modification time, as stored in ZIP headers.
+pub(crate) fn dos_datetime(mtime: SystemTime) -> (u16, u16) {
+    dos_fields(clamp_to_dos_range(civil_from_unix_local(unix_secs(mtime))))
+}
+
+/// DOS `(time, date)` for 1980-01-01 00:00:00, used when an entry has no mtime.
+pub(crate) const DOS_EPOCH: (u16, u16) = (0, (1 << 5) | 1);
+
+/// Pack an in-range civil time into DOS `(time, date)`; odd seconds round down.
+fn dos_fields(c: Civil) -> (u16, u16) {
+    let time = (u16::from(c.hour) << 11) | (u16::from(c.minute) << 5) | u16::from(c.second / 2);
+    let date = (((c.year - 1980) as u16) << 9) | (u16::from(c.month) << 5) | u16::from(c.day);
+    (time, date)
 }
 
 /// Payload of a 0x5455 extended-timestamp field carrying only the mtime
@@ -193,24 +201,45 @@ mod tests {
         assert_eq!(clamp_to_dos_range(ok), ok);
     }
 
+    fn unpack(f: (u16, u16)) -> (i64, u8, u8, u8, u8, u8) {
+        let (t, d) = f;
+        (
+            1980 + i64::from(d >> 9),
+            ((d >> 5) & 0xf) as u8,
+            (d & 0x1f) as u8,
+            (t >> 11) as u8,
+            ((t >> 5) & 0x3f) as u8,
+            ((t & 0x1f) * 2) as u8,
+        )
+    }
+
     #[test]
     fn dos_datetime_pre_1980_is_clamped() {
-        let dt = dos_datetime(UNIX_EPOCH);
-        assert_eq!((dt.year(), dt.month(), dt.day()), (1980, 1, 1));
-        assert_eq!((dt.hour(), dt.minute(), dt.second()), (0, 0, 0));
+        assert_eq!(dos_datetime(UNIX_EPOCH), DOS_EPOCH);
+        assert_eq!(unpack(DOS_EPOCH), (1980, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn dos_field_packing() {
+        assert_eq!(
+            unpack(dos_fields(civ(2107, 12, 31, 23, 59, 58))),
+            (2107, 12, 31, 23, 59, 58)
+        );
+        assert_eq!(
+            unpack(dos_fields(civ(2024, 2, 29, 13, 7, 9))),
+            (2024, 2, 29, 13, 7, 8)
+        );
     }
 
     #[test]
     fn dos_datetime_matches_local_civil() {
         let secs = 1_700_000_001; // odd second
-        let dt = dos_datetime(UNIX_EPOCH + Duration::from_secs(secs as u64));
+        let got = unpack(dos_datetime(UNIX_EPOCH + Duration::from_secs(secs as u64)));
         let c = civil_from_unix_local(secs);
-        assert_eq!(i64::from(dt.year()), c.year);
-        assert_eq!(dt.month(), c.month);
-        assert_eq!(dt.day(), c.day);
-        assert_eq!(dt.hour(), c.hour);
-        assert_eq!(dt.minute(), c.minute);
-        assert_eq!(dt.second(), c.second & !1);
+        assert_eq!(
+            got,
+            (c.year, c.month, c.day, c.hour, c.minute, c.second & !1)
+        );
     }
 
     #[test]

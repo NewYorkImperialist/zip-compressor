@@ -36,6 +36,10 @@ pub struct CompressArgs {
     #[arg(long, conflicts_with = "level")]
     store: bool,
 
+    /// Worker threads; 0 uses one per CPU core. Output is identical either way.
+    #[arg(short = 't', long, default_value_t = 0, value_name = "N")]
+    threads: usize,
+
     /// How to treat symbolic links in the inputs.
     #[arg(long, value_enum, default_value_t = Symlinks::Store)]
     symlinks: Symlinks,
@@ -83,7 +87,7 @@ impl CompressArgs {
             },
             symlinks: self.symlinks.into(),
             exclude_junk: !self.keep_junk,
-            ..Default::default()
+            threads: self.threads,
         }
     }
 }
@@ -125,7 +129,7 @@ pub fn run(args: CompressArgs) -> Result<Outcome> {
 
     match result {
         Ok(summary) => {
-            print_summary(&summary);
+            print_summary(&summary, effective_threads(args.threads));
             Ok(Outcome::Ok)
         }
         Err(Error::Cancelled) => Ok(Outcome::Cancelled),
@@ -196,7 +200,16 @@ impl ProgressLine {
     }
 }
 
-fn print_summary(s: &Summary) {
+/// The thread count a `--threads` value resolves to (0 means every core).
+fn effective_threads(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        requested
+    }
+}
+
+fn print_summary(s: &Summary, threads: usize) {
     let ratio = ratio_percent(s.bytes_in, s.bytes_out)
         .map(|r| format!("{r:.1}%"))
         .unwrap_or_else(|| "n/a".into());
@@ -212,5 +225,9 @@ fn print_summary(s: &Summary) {
         format_bytes(s.bytes_in),
         format_bytes(s.bytes_out)
     );
-    println!("{} at {speed}", format_duration(s.elapsed));
+    let unit = if threads == 1 { "thread" } else { "threads" };
+    println!(
+        "{} at {speed} ({threads} {unit})",
+        format_duration(s.elapsed)
+    );
 }

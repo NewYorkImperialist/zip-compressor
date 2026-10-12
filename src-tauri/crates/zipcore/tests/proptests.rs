@@ -50,7 +50,11 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
 
     #[test]
-    fn random_trees_round_trip(items in prop::collection::vec(item_strategy(), 0..12), method in method_strategy()) {
+    fn random_trees_round_trip(
+        items in prop::collection::vec(item_strategy(), 0..12),
+        method in method_strategy(),
+        threads in 1usize..=8,
+    ) {
         let td = tempfile::tempdir().unwrap();
         let root = td.path().join("tree");
         fs::create_dir(&root).unwrap();
@@ -85,8 +89,14 @@ proptest! {
             }
         }
 
-        let (zip, summary) = compress_ok(std::slice::from_ref(&root), &opts(method));
+        let (zip, summary) = compress_ok(std::slice::from_ref(&root), &opts_t(method, threads));
+        let (zip1, _) = compress_ok(std::slice::from_ref(&root), &opts_t(method, 1));
+        prop_assert!(zip == zip1, "threads={} archive differs from threads=1", threads);
         let entries = read_entries(&zip);
+        let layout = layout_problems(&parse_raw_bytes(&zip));
+        prop_assert!(layout.is_empty(), "layout: {:?}", layout);
+        let rule = size_rule_problems(&entries);
+        prop_assert!(rule.is_empty(), "size rule: {:?}", rule);
         assert_safe_names(&entries);
         assert_nodes_eq(&archive_nodes(&entries), &expected_entries(&root));
         prop_assert_eq!(summary.files, files.len() as u64);

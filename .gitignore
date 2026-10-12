@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Benchmark corpus (scripts/fetch-corpus.sh)
+bench-data/

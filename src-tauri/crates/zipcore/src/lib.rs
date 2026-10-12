@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+mod codec;
+mod container;
 mod output;
 mod timeconv;
 mod walk;
@@ -135,7 +137,6 @@ pub fn compress<W: Write + Seek>(
         progress,
         cancel,
         Path::new("<archive output>"),
-        None,
     )?;
     let mut summary = written.summary;
     summary.elapsed = started.elapsed();

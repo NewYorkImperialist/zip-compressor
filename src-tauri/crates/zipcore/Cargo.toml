@@ -7,12 +7,18 @@ description = "Compression engine for zip-compressor"
 license = "MIT"
 
 [dependencies]
-# Deflate (zlib-rs + zopfli), plus zstd/xz/AES for the later "Ultra" and encryption presets.
+# Only for the public `Error::Zip` variant (and the later zstd/xz/AES presets);
+# archives are written by our own container writer (src/container.rs).
 zip.workspace = true
 walkdir.workspace = true
 thiserror.workspace = true
-# Used only to probe whether a large file is worth deflating (same zlib-rs backend zip uses).
+# Raw deflate (zlib-rs backend; `any_zlib` gives `set_dictionary` for chunked deflate).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Worker pool with scoped tasks (workers borrow the scanned entries; the scope
+# joins every task before `compress` returns).
+rayon = "1"
+# SIMD CRC-32 with `combine` for per-chunk CRCs (already in the tree via zip/flate2).
+crc32fast = "1.5"
 
 [target.'cfg(unix)'.dependencies]
 # localtime_r for converting mtimes to local DOS time.
@@ -22,3 +28,5 @@ libc = "0.2"
 tempfile = "3"
 filetime = "0.2"
 proptest = "1"
+# Independent deflate sizing for constructing threshold test inputs.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

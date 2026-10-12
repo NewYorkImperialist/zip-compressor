@@ -125,3 +125,33 @@ fn force_overwrites_and_store_works() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(fs::read(&zip).unwrap().starts_with(b"PK"));
 }
+
+#[test]
+fn threads_option_is_reported_and_output_is_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = make_tree(dir.path());
+    let one = dir.path().join("one.zip");
+    let four = dir.path().join("four.zip");
+
+    for (zip, threads, expect) in [(&one, "1", "(1 thread)"), (&four, "4", "(4 threads)")] {
+        let out = zipc([
+            OsStr::new("compress"),
+            data.as_os_str(),
+            OsStr::new("-o"),
+            zip.as_os_str(),
+            OsStr::new("-t"),
+            OsStr::new(threads),
+            OsStr::new("-q"),
+        ]);
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expect), "stdout: {stdout}");
+    }
+    assert_eq!(fs::read(&one).unwrap(), fs::read(&four).unwrap());
+}
+
+#[test]
+fn threads_must_be_a_number() {
+    let out = zipc(["compress", "a", "-o", "a.zip", "--threads", "many"]);
+    assert_eq!(out.status.code(), Some(2));
+}
