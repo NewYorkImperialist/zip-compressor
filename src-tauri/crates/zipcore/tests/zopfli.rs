@@ -369,8 +369,10 @@ fn cancel_during_max_chunked_file() {
     let err = res.expect_err("Max run on 12 MiB of text finished before the cancel?");
     assert!(matches!(err, Error::Cancelled), "got {err:?}");
     eprintln!("Max chunked cancel latency: {lag:?} (fired by progress: {via_progress})");
+    // Typically well under a second; the bound leaves room for slow,
+    // oversubscribed CI runners (8 workers on 3-4 cores take ~3.5 s there).
     assert!(
-        lag < Duration::from_secs(3),
+        lag < Duration::from_secs(8),
         "took {lag:?} after cancel to stop"
     );
     assert!(

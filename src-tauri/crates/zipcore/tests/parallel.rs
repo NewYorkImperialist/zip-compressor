@@ -157,12 +157,41 @@ fn same_summary(a: &Summary, b: &Summary, how: &str) {
 
 fn first_diff(a: &[u8], b: &[u8]) -> String {
     let i = a.iter().zip(b).position(|(x, y)| x != y);
-    format!(
+    let mut msg = format!(
         "lengths {} vs {}, first differing byte at {:?}",
         a.len(),
         b.len(),
         i.or((a.len() != b.len()).then_some(a.len().min(b.len())))
-    )
+    );
+    if let Some(i) = i {
+        // Which entry's local header + data holds it, and the bytes around it.
+        if let Ok(mut z) = zip::ZipArchive::new(std::io::Cursor::new(a)) {
+            let mut owner = None;
+            for k in 0..z.len() {
+                if let Ok(f) = z.by_index_raw(k) {
+                    if f.header_start() <= i as u64 {
+                        owner = Some((
+                            f.header_start(),
+                            f.name().map(|n| n.into_owned()).unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+            if let Some((start, name)) = owner {
+                msg += &format!(
+                    " (entry {name:?}, {} bytes past its local header)",
+                    i as u64 - start
+                );
+            }
+        }
+        let (lo, hi) = (i.saturating_sub(8), (i + 16).min(a.len()).min(b.len()));
+        msg += &format!(
+            "\n  a[{lo}..{hi}] = {:02x?}\n  b[{lo}..{hi}] = {:02x?}",
+            &a[lo..hi],
+            &b[lo..hi]
+        );
+    }
+    msg
 }
 
 /// One threads=1 reference; every other thread count, through both

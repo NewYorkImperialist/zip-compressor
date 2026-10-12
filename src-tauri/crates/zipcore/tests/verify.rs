@@ -847,9 +847,12 @@ with zipfile.ZipFile(sys.argv[1], 'w') as z:
     let r = ok_report(&out);
     assert_eq!(r.bytes_checked, 5000 + 50000 + 256 * 300);
 
-    // Written to an unseekable stream: data descriptors.
-    let piped = dir.path().join("piped.zip");
-    let script = r#"
+    // Written to an unseekable stream: data descriptors. Not on Windows,
+    // where a pipe looks seekable to Python (lseek succeeds), so zipfile
+    // "seeks back" to patch headers and writes a genuinely broken archive.
+    if !cfg!(windows) {
+        let piped = dir.path().join("piped.zip");
+        let script = r#"
 import sys, zipfile
 z = zipfile.ZipFile(sys.stdout.buffer, 'w')
 z.writestr('a.txt', 'q' * 5000, zipfile.ZIP_DEFLATED)
@@ -858,8 +861,9 @@ with z.open('b.bin', 'w', force_zip64=True) as f:
     f.write(b'r' * 70000)
 z.close()
 "#;
-    run_piped_to(Command::new(&py).arg("-I").arg("-c").arg(script), &piped);
-    assert_eq!(ok_report(&piped).bytes_checked, 5000 + 6 + 70000);
+        run_piped_to(Command::new(&py).arg("-I").arg("-c").arg(script), &piped);
+        assert_eq!(ok_report(&piped).bytes_checked, 5000 + 6 + 70000);
+    }
 
     // LZMA and BZIP2 entries can't be verified.
     let other = dir.path().join("other.zip");

@@ -229,7 +229,7 @@ pub(crate) fn scan(
             };
 
             let name = if kind == Kind::Dir { name + "/" } else { name };
-            let md = dent.metadata().map_err(|e| walk_err(dent.path(), e))?;
+            let md = entry_metadata(&dent).map_err(|e| io_err(dent.path(), e))?;
             let kind = match kind {
                 Kind::File { .. } => Kind::File { size: md.len() },
                 k => k,
@@ -244,6 +244,29 @@ pub(crate) fn scan(
         }
     }
     Ok(entries)
+}
+
+/// Metadata of a walked entry, as the entry itself reports it.
+///
+/// On Unix this is the `lstat` (or `stat`, when following links) walkdir
+/// already does. On Windows, walkdir's metadata comes from the directory
+/// listing (`FindNextFile`), which NTFS updates lazily: a directory's
+/// last-write time there can lag files just added to it, so the archive
+/// would depend on when it was made. Asking the file itself (one open per
+/// entry) gives the current values.
+#[cfg(not(windows))]
+fn entry_metadata(dent: &walkdir::DirEntry) -> std::io::Result<std::fs::Metadata> {
+    dent.metadata().map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn entry_metadata(dent: &walkdir::DirEntry) -> std::io::Result<std::fs::Metadata> {
+    // `file_type` is the link's own type only when links are not followed.
+    if dent.file_type().is_symlink() {
+        std::fs::symlink_metadata(dent.path())
+    } else {
+        std::fs::metadata(dent.path())
+    }
 }
 
 #[cfg(test)]
