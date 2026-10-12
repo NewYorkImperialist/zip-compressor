@@ -16,12 +16,59 @@ mod walk;
 mod writer;
 
 /// How each entry's data is encoded.
+///
+/// Every method produces standard Deflate or Stored entries, so archives open
+/// in every unzip tool (Explorer, Archive Utility, Info-ZIP, 7-Zip). That is a
+/// product rule: no method may require the recipient to install anything.
+///
+/// Whatever the method, an entry is never written larger than storing it
+/// (beyond the documented chunk overhead for big files).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     /// No compression.
     Store,
-    /// Deflate at the given level (0-9). Opens in every unzip tool.
+    /// Deflate at the given level (0-9).
     Deflate { level: u8 },
+    /// Deflate produced by the Zopfli optimizer: same format as
+    /// [`Method::Deflate`], typically 3-8% smaller, but far slower.
+    /// `iterations` trades time for size (Zopfli's default is 15).
+    Zopfli { iterations: u16 },
+}
+
+/// Named speed/size trade-offs offered by the CLI and the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    /// Deflate level 1.
+    Fast,
+    /// Deflate level 6.
+    #[default]
+    Balanced,
+    /// Deflate level 9, trying several encoder settings per small file.
+    Best,
+    /// Zopfli. Smallest archive; slow.
+    Max,
+}
+
+impl Preset {
+    pub const ALL: [Preset; 4] = [Preset::Fast, Preset::Balanced, Preset::Best, Preset::Max];
+
+    pub fn method(self) -> Method {
+        match self {
+            Preset::Fast => Method::Deflate { level: 1 },
+            Preset::Balanced => Method::Deflate { level: 6 },
+            Preset::Best => Method::Deflate { level: 9 },
+            Preset::Max => Method::Zopfli { iterations: 15 },
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Preset::Fast => "fast",
+            Preset::Balanced => "balanced",
+            Preset::Best => "best",
+            Preset::Max => "max",
+        }
+    }
 }
 
 impl Default for Method {

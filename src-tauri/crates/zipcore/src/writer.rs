@@ -117,6 +117,8 @@ fn effective_method(m: Method) -> Method {
             0 => Method::Store,
             l => Method::Deflate { level: l },
         },
+        // Phase 3 placeholder until the new codecs land.
+        Method::Zopfli { .. } => Method::Deflate { level: 9 },
     }
 }
 
@@ -1006,6 +1008,7 @@ pub(crate) fn write_archive<W: Write + Seek>(
     let level = match effective_method(opts.method) {
         Method::Store => None,
         Method::Deflate { level } => Some(u32::from(level)),
+        _ => unreachable!("effective_method maps Phase 3 methods to Deflate for now"),
     };
     let threads = worker_count(opts.threads);
     let pool = rayon::ThreadPoolBuilder::new()
