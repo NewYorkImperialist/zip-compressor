@@ -16,7 +16,7 @@ this rule, including the slowest.
 |---|---|---|
 | `fast` | Deflate level 1 | Quickest; files come out a little larger. |
 | `balanced` (default) | Deflate level 6 | Good size at high speed. Right for most things. |
-| `best` | Deflate level 9; files under 1 MiB also try level 6 and keep the smaller | Slightly smaller than `balanced`, about level-9 speed. |
+| `best` | Deflate level 9; files under 1 MiB also try level 6 (and level 9 tuned for tables and logs, where that tends to help) and keep the smallest | Slightly smaller than `balanced`, about level-9 speed. |
 | `max` | Zopfli, 15 iterations (still plain Deflate) | Smallest file that still opens anywhere. **Much slower**, often 50–100x slower than `best`, for typically 3–8% smaller output. For archiving or sending large text/code. |
 
 Already-compressed data (photos, video, archives) is never made larger: an
@@ -30,8 +30,8 @@ the input (lower is better).
 | Dataset | Finder (`ditto`) | `zip -9` | zipc `balanced` | zipc `best` | zipc `max` |
 |---|---|---|---|---|---|
 | Silesia corpus, 212 MB | 32.19%, 6.0 s | 31.91%, 15.0 s | 32.51%, 0.53 s | 31.89%, 1.1 s | **30.45%**, 218 s |
-| Rust source, 26 MB | 23.51%, 0.51 s | 23.48%, 1.04 s | 23.25%, 0.10 s | 23.08%, 0.25 s | **22.24%**, 25 s |
-| 20,000 small files, 42 MB | 50.98%, 1.7 s | 51.35%, 1.7 s | 48.80%, 0.41 s | 48.16%, 0.77 s | **47.23%**, 17 s |
+| Rust source, 26 MB | 23.51%, 0.52 s | 23.48%, 1.04 s | 23.25%, 0.09 s | 23.09%, 0.16 s | **22.24%**, 24 s |
+| 20,000 small files, 42 MB | 50.98%, 1.8 s | 51.35%, 1.6 s | 48.80%, 0.27 s | 48.16%, 0.57 s | **47.23%**, 17 s |
 | One 1.3 GB file | 44.58%, 34 s | 44.39%, 78 s | 44.82%, 3.2 s | 44.35%, 6.2 s | **43.17%**, 18 min |
 | Photos (HEIC/JPEG), 36 MB | 99.89%, 0.71 s | 99.84%, 0.87 s | 99.87%, 0.15 s | 99.86%, 0.18 s | **99.82%**, 2.1 s |
 
@@ -42,10 +42,21 @@ smaller than `zip -9` on text, code and mixed data, but takes minutes on
 large inputs (18 minutes for 1.3 GB).
 <!-- /phase3-numbers -->
 
+## Download
+
+Installers for macOS (`.dmg`, Apple Silicon and Intel), Windows (`.exe`,
+`.msi`) and Linux (`.AppImage`, `.deb`, `.rpm`), plus the `zipc` command-line
+tool, are on the [Releases](https://github.com/NewYorkImperialist/zip-compressor/releases)
+page with SHA-256 checksums.
+
+The builds are not signed, so the first launch shows a warning: on macOS,
+right-click the app and choose **Open**; on Windows, click **More info > Run
+anyway** in SmartScreen.
+
 ## Command line
 
-Build it with `cargo build --release -p zipc` from `src-tauri/`; the binary is
-`src-tauri/target/release/zipc`.
+Download it from Releases, or build it with `cargo build --release -p zipc`
+from `src-tauri/`; the binary is `src-tauri/target/release/zipc`.
 
 ```sh
 zipc compress project/ notes.txt -o out.zip              # balanced
@@ -164,4 +175,8 @@ dataset descriptions are in [docs/benchmarks.md](docs/benchmarks.md).
 - `src-tauri/crates/zipc` — the `zipc` command-line tool.
 - `src-tauri/src` — Tauri commands for the desktop app.
 - `src/` — the app's web front end (plain HTML, CSS and JavaScript).
-- `scripts/` — corpus and benchmark scripts.
+- `scripts/` — corpus, benchmark and CI regression scripts.
+- `tests/ui/` — the front end's headless smoke test.
+- `docs/` — benchmark results.
+- `.github/workflows/` — CI (`ci.yml`) and release builds on a `v*` tag
+  (`release.yml`).
