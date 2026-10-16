@@ -16,6 +16,10 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
+use std::time::SystemTime;
+
+use crate::timeconv;
 
 pub(crate) const LOCAL_SIG: u32 = 0x0403_4b50;
 const CENTRAL_SIG: u32 = 0x0201_4b50;
@@ -77,6 +81,89 @@ impl Source {
     }
 }
 
+/// Open `path` and parse its central directory, mapping failures to the
+/// public error type: I/O errors name `path`, structural damage is
+/// [`crate::Error::InvalidArchive`]. Anything that is not a regular file (a
+/// directory, a FIFO) is refused before it is read.
+pub(crate) fn open_archive(path: &Path) -> crate::Result<(Source, Directory)> {
+    let io_err = |e: io::Error| crate::Error::Io {
+        path: path.to_path_buf(),
+        source: e,
+    };
+    let file = File::open(path).map_err(io_err)?;
+    if !file.metadata().map_err(io_err)?.is_file() {
+        return Err(crate::Error::InvalidArchive("not a regular file".into()));
+    }
+    let mut src = Source::new(file).map_err(io_err)?;
+    let dir = read_directory(&mut src).map_err(|e| match e {
+        ReadError::Io(e) => io_err(e),
+        ReadError::Invalid(m) => crate::Error::InvalidArchive(m),
+    })?;
+    Ok((src, dir))
+}
+
+/// Fill `buf` from `offset` without moving a shared cursor, so several
+/// threads can read one `File` at once (each extraction worker reads its own
+/// entries through the same handle).
+#[cfg(unix)]
+pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Windows: `seek_read` may return short reads (and moves the cursor, which
+/// nothing here relies on), so loop like `read_exact`.
+#[cfg(windows)]
+pub(crate) fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(file, buf, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A [`Read`] over `len` bytes of a shared `File` starting at `pos`, using
+/// positional reads ([`read_exact_at`]). Reading past the span is EOF.
+pub(crate) struct SpanReader<'a> {
+    file: &'a File,
+    pos: u64,
+    left: u64,
+}
+
+impl<'a> SpanReader<'a> {
+    pub fn new(file: &'a File, pos: u64, len: u64) -> Self {
+        SpanReader {
+            file,
+            pos,
+            left: len,
+        }
+    }
+}
+
+impl Read for SpanReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.left.min(buf.len() as u64) as usize;
+        if n == 0 {
+            return Ok(0);
+        }
+        read_exact_at(self.file, self.pos, &mut buf[..n])?;
+        self.pos += n as u64;
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 pub(crate) fn u16_at(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([b[i], b[i + 1]])
 }
@@ -101,15 +188,57 @@ pub(crate) struct CentralEntry {
     pub crc: u32,
     pub compressed: u64,
     pub uncompressed: u64,
+    /// "Version made by": the high byte is the host system (3 = Unix), which
+    /// says how to read `external_attrs`.
+    pub version_made_by: u16,
+    /// MS-DOS modification time and date fields (local time, 2-second steps).
+    pub dos_time: u16,
+    pub dos_date: u16,
+    /// External file attributes (Unix mode in the high 16 bits on Unix hosts).
+    pub external_attrs: u32,
+    /// Central extra field bytes (e.g. the 0x5455 extended timestamp).
+    pub extra: Vec<u8>,
     /// Absolute file offset of the local header (prepended data accounted for).
     pub local_offset: u64,
     /// Problems found while parsing this record.
     pub problems: Vec<String>,
 }
 
+/// Host system number for Unix in the high byte of "version made by".
+pub(crate) const HOST_UNIX: u8 = 3;
+/// File type bits of a Unix `st_mode`.
+pub(crate) const S_IFMT: u32 = 0o170000;
+pub(crate) const S_IFLNK: u32 = 0o120000;
+
 impl CentralEntry {
     pub fn is_dir(&self) -> bool {
         self.raw_name.last() == Some(&b'/')
+    }
+
+    /// The Unix `st_mode` (type and permission bits) when the entry was made
+    /// on a Unix host and recorded one (the high 16 bits of the external
+    /// attributes). Other hosts store something else there, or nothing.
+    pub fn unix_mode(&self) -> Option<u32> {
+        let mode = self.external_attrs >> 16;
+        ((self.version_made_by >> 8) as u8 == HOST_UNIX && mode != 0).then_some(mode)
+    }
+
+    /// A Unix symlink entry: its data is the link target. Only Unix hosts
+    /// can say so (there is no DOS attribute for it).
+    pub fn is_symlink(&self) -> bool {
+        self.unix_mode().is_some_and(|m| m & S_IFMT == S_IFLNK)
+    }
+
+    /// Modification time: the 0x5455 extended timestamp (UTC seconds) when
+    /// the central record carries one with the mtime flag, otherwise the DOS
+    /// date/time read as local time. `None` when neither is usable (the DOS
+    /// fields are zero or out of range).
+    pub fn modified(&self) -> Option<SystemTime> {
+        let secs = extra_fields(&self.extra)
+            .find(|(id, _)| *id == timeconv::EXT_TIMESTAMP_ID)
+            .and_then(|(_, data)| timeconv::ext_timestamp_mtime(data))
+            .or_else(|| timeconv::unix_from_dos_local(self.dos_time, self.dos_date))?;
+        Some(timeconv::system_time_from_unix(secs))
     }
 }
 
@@ -363,8 +492,11 @@ fn read_central(rd: &mut impl Read, base: u64) -> Result<CentralEntry, ReadError
     if u32_at(&h, 0) != CENTRAL_SIG {
         return invalid("bad signature (damaged central directory)");
     }
+    let version_made_by = u16_at(&h, 4);
     let flags = u16_at(&h, 8);
     let method = u16_at(&h, 10);
+    let dos_time = u16_at(&h, 12);
+    let dos_date = u16_at(&h, 14);
     let crc = u32_at(&h, 16);
     let csize32 = u32_at(&h, 20);
     let usize32 = u32_at(&h, 24);
@@ -372,6 +504,7 @@ fn read_central(rd: &mut impl Read, base: u64) -> Result<CentralEntry, ReadError
     let extra_len = usize::from(u16_at(&h, 30));
     let comment_len = usize::from(u16_at(&h, 32));
     let disk16 = u16_at(&h, 34);
+    let external_attrs = u32_at(&h, 38);
     let offset32 = u32_at(&h, 42);
     let raw_name = read_vec(rd, name_len)?;
     let extra = read_vec(rd, extra_len)?;
@@ -416,6 +549,11 @@ fn read_central(rd: &mut impl Read, base: u64) -> Result<CentralEntry, ReadError
         crc,
         compressed,
         uncompressed,
+        version_made_by,
+        dos_time,
+        dos_date,
+        external_attrs,
+        extra,
         local_offset,
         problems,
     })
