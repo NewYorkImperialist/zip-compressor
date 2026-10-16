@@ -356,6 +356,7 @@ pub struct ExtractOptions {
     pub symlinks: bool,
     /// Only extract entries whose archive path equals one of these or lies
     /// under one of them (a directory prefix). Empty means everything.
+    /// A pattern that matches no entry is [`Error::NotFound`].
     pub only: Vec<String>,
     /// Worker threads. `0` means one per available CPU core.
     pub threads: usize,

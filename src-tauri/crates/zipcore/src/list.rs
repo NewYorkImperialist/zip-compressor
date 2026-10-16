@@ -3,10 +3,8 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
-use std::time::SystemTime;
 
 use crate::reader::{self, CentralEntry, ReadError, Source, FLAG_ENCRYPTED};
-use crate::timeconv;
 use crate::{EntryInfo, EntryKind, Error, Listing, Result};
 
 /// "Version made by" host byte for Unix (external attributes hold `st_mode`).
@@ -58,7 +56,7 @@ fn entry_info(e: &CentralEntry) -> EntryInfo {
         compressed: e.compressed,
         uncompressed: e.uncompressed,
         crc32: e.crc,
-        modified: modified(e),
+        modified: e.modified(),
         unix_mode: mode.map(|m| m & 0o7777),
         encrypted: e.flags & FLAG_ENCRYPTED != 0,
     }
@@ -85,21 +83,6 @@ fn kind(e: &CentralEntry, mode: Option<u32>) -> EntryKind {
     } else {
         EntryKind::File
     }
-}
-
-/// The 0x5455 mtime (UTC) if present, else the DOS fields as local time.
-fn modified(e: &CentralEntry) -> Option<SystemTime> {
-    let ext = reader::extra_fields(&e.extra)
-        .find(|(id, _)| *id == timeconv::EXT_TIMESTAMP_ID)
-        .and_then(|(_, data)| timeconv::ext_timestamp_mtime(data));
-    let secs = match ext {
-        Some(s) => s,
-        None => {
-            let c = timeconv::civil_from_dos(e.dos_time, e.dos_date)?;
-            timeconv::unix_from_civil_local(c)
-        }
-    };
-    timeconv::system_time_from_unix(secs)
 }
 
 #[cfg(test)]

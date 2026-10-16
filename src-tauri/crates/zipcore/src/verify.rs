@@ -12,9 +12,14 @@
 //!    buffers, stopped as soon as it produces more than the declared size),
 //!    CRC-32 and sizes against the central directory, and the data descriptor
 //!    when flag bit 3 is set.
+//!
+//! The pieces extraction needs too (locating data spans, the overlap check,
+//! header comparison, and the streaming decoder [`decode`], which hands the
+//! uncompressed bytes to a sink) are `pub(crate)` and shared with
+//! `extract.rs`.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -22,23 +27,26 @@ use std::time::Instant;
 use zlib_rs::{Inflate, InflateFlush, Status};
 
 use crate::reader::{
-    self, u32_at, u64_at, CentralEntry, LocalHeader, ReadError, Source, DESCRIPTOR_SIG,
+    self, u32_at, u64_at, CentralEntry, LocalHeader, Source, SpanReader, DESCRIPTOR_SIG,
     FLAG_DESCRIPTOR, FLAG_ENCRYPTED, FLAG_STRONG_ENCRYPTION,
 };
 use crate::{Error, Problem, Progress, Result, TestReport};
 
-const BUF_LEN: usize = 64 * 1024;
+pub(crate) const BUF_LEN: usize = 64 * 1024;
 /// Progress is reported at least this often (in uncompressed bytes) within an entry.
-const PROGRESS_STEP: u64 = 4 << 20;
+pub(crate) const PROGRESS_STEP: u64 = 4 << 20;
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATED: u16 = 8;
 const METHOD_AES: u16 = 99;
 /// Raw deflate window.
 const WINDOW_BITS: u8 = 15;
 
-/// Why checking stopped early.
-enum Stop {
+/// Why decoding stopped early.
+pub(crate) enum Stop {
+    /// Reading the archive failed.
     Io(io::Error),
+    /// The sink failed (extraction: writing the output file).
+    Sink(io::Error),
     Cancelled,
 }
 
@@ -49,27 +57,69 @@ impl From<io::Error> for Stop {
 }
 
 /// Outcome of reading one entry's data.
-struct DataCheck {
-    crc: u32,
+pub(crate) struct DataCheck {
+    pub crc: u32,
     /// Uncompressed bytes produced.
-    size: u64,
+    pub size: u64,
     /// Set when the data could not be decoded to the end (damage, or more
     /// output than declared); CRC and size are then not meaningful.
-    problem: Option<String>,
+    pub problem: Option<String>,
+}
+
+impl DataCheck {
+    /// Why the decoded data doesn't match `e`'s central record, if it doesn't:
+    /// a decoding problem, else the size, else the CRC-32.
+    pub fn mismatch(&self, e: &CentralEntry) -> Option<String> {
+        if let Some(m) = &self.problem {
+            return Some(m.clone());
+        }
+        if self.size != e.uncompressed {
+            return Some(format!(
+                "size mismatch: {} bytes of data, the central directory says {}",
+                self.size, e.uncompressed
+            ));
+        }
+        if self.crc != e.crc {
+            return Some(format!(
+                "bad CRC-32: computed {:08x}, the central directory says {:08x}",
+                self.crc, e.crc
+            ));
+        }
+        None
+    }
 }
 
 /// Problems with an entry's local header and data span, or the header and the
 /// absolute end of its data.
-type Located = std::result::Result<(LocalHeader, u64), String>;
+pub(crate) type Located = std::result::Result<(LocalHeader, u64), String>;
 
-struct Checker<'a> {
-    src: Source,
+/// Decoder input and output buffers, reused across entries.
+pub(crate) struct Buffers {
+    inbuf: Vec<u8>,
+    outbuf: Vec<u8>,
+}
+
+impl Buffers {
+    pub fn new() -> Self {
+        Buffers {
+            inbuf: vec![0u8; BUF_LEN],
+            outbuf: vec![0u8; BUF_LEN],
+        }
+    }
+}
+
+/// Progress accounting for `test_archive` (single-threaded).
+struct Meter<'a> {
     cancel: &'a AtomicBool,
     progress: &'a mut dyn FnMut(&Progress),
     p: Progress,
     next_report: u64,
-    inbuf: Vec<u8>,
-    outbuf: Vec<u8>,
+}
+
+struct Checker<'a> {
+    src: Source,
+    meter: Meter<'a>,
+    bufs: Buffers,
 }
 
 pub(crate) fn test_archive(
@@ -85,15 +135,7 @@ pub(crate) fn test_archive(
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }
-    let file = File::open(path).map_err(io_err)?;
-    if !file.metadata().map_err(io_err)?.is_file() {
-        return Err(Error::InvalidArchive("not a regular file".into()));
-    }
-    let mut src = Source::new(file).map_err(io_err)?;
-    let dir = reader::read_directory(&mut src).map_err(|e| match e {
-        ReadError::Io(e) => io_err(e),
-        ReadError::Invalid(m) => Error::InvalidArchive(m),
-    })?;
+    let (src, dir) = reader::open_archive(path)?;
 
     let entries = &dir.entries;
     let mut problems: Vec<Problem> = dir
@@ -111,32 +153,33 @@ pub(crate) fn test_archive(
         .fold(0u64, |acc, e| acc.saturating_add(e.uncompressed));
     let mut ck = Checker {
         src,
-        cancel,
-        progress,
-        p: Progress {
-            current: String::new(),
-            files_done: 0,
-            files_total: entries.len() as u64,
-            bytes_done: 0,
-            bytes_total,
+        meter: Meter {
+            cancel,
+            progress,
+            p: Progress {
+                current: String::new(),
+                files_done: 0,
+                files_total: entries.len() as u64,
+                bytes_done: 0,
+                bytes_total,
+            },
+            next_report: PROGRESS_STEP,
         },
-        next_report: PROGRESS_STEP,
-        inbuf: vec![0u8; BUF_LEN],
-        outbuf: vec![0u8; BUF_LEN],
+        bufs: Buffers::new(),
     };
 
     let mut run = || -> std::result::Result<(), Stop> {
         // Locate every entry's data.
         let mut located: Vec<Located> = Vec::with_capacity(entries.len());
         for e in entries {
-            ck.check_cancel()?;
+            ck.meter.check_cancel()?;
             located.push(locate(&mut ck.src, e, dir.cd_start)?);
         }
-        let overlaps = find_overlaps(entries, &located);
+        let overlaps = find_overlaps(|i| entries[i].local_offset, &located);
 
         for (i, e) in entries.iter().enumerate() {
-            ck.check_cancel()?;
-            ck.p.current = e.name.clone();
+            ck.meter.check_cancel()?;
+            ck.meter.p.current = e.name.clone();
             let mut msgs = e.problems.clone();
             match &located[i] {
                 Err(m) => msgs.push(m.clone()),
@@ -169,27 +212,28 @@ pub(crate) fn test_archive(
                 entry: Some(e.name.clone()),
                 message,
             }));
-            ck.p.files_done = i as u64 + 1;
-            (ck.progress)(&ck.p);
+            ck.meter.p.files_done = i as u64 + 1;
+            (ck.meter.progress)(&ck.meter.p);
         }
         Ok(())
     };
     match run() {
         Ok(()) => {}
         Err(Stop::Cancelled) => return Err(Error::Cancelled),
-        Err(Stop::Io(e)) => return Err(io_err(e)),
+        Err(Stop::Io(e) | Stop::Sink(e)) => return Err(io_err(e)),
     }
 
     Ok(TestReport {
         entries: entries.len() as u64,
-        bytes_checked: ck.p.bytes_done,
+        bytes_checked: ck.meter.p.bytes_done,
         problems,
         elapsed: started.elapsed(),
     })
 }
 
-/// `Ok` if this entry's data can be checked, else why not.
-fn verifiable(e: &CentralEntry) -> std::result::Result<(), String> {
+/// `Ok` if this entry's data can be decoded (not encrypted; Stored or
+/// Deflate), else why not.
+pub(crate) fn verifiable(e: &CentralEntry) -> std::result::Result<(), String> {
     if e.method == METHOD_AES {
         return Err("AES-encrypted; can't verify without the password".into());
     }
@@ -205,7 +249,7 @@ fn verifiable(e: &CentralEntry) -> std::result::Result<(), String> {
     }
 }
 
-fn method_name(m: u16) -> &'static str {
+pub(crate) fn method_name(m: u16) -> &'static str {
     match m {
         1 => "Shrink",
         2..=5 => "Reduce",
@@ -228,7 +272,7 @@ fn method_name(m: u16) -> &'static str {
 }
 
 /// Read the local header and bounds-check the data span.
-fn locate(src: &mut Source, e: &CentralEntry, cd_start: u64) -> io::Result<Located> {
+pub(crate) fn locate(src: &mut Source, e: &CentralEntry, cd_start: u64) -> io::Result<Located> {
     let lh = match reader::read_local(src, e.local_offset, cd_start)? {
         Ok(h) => h,
         Err(m) => return Ok(Err(m)),
@@ -250,15 +294,16 @@ fn locate(src: &mut Source, e: &CentralEntry, cd_start: u64) -> io::Result<Locat
 }
 
 /// For each entry, the earlier entry (in file order) whose span it overlaps.
-fn find_overlaps(entries: &[CentralEntry], located: &[Located]) -> Vec<Option<usize>> {
+/// `local_offset(i)` is the start of entry `i` (its local header); entries
+/// whose `located` slot is an `Err` take no part.
+pub(crate) fn find_overlaps(
+    local_offset: impl Fn(usize) -> u64,
+    located: &[Located],
+) -> Vec<Option<usize>> {
     let mut spans: Vec<(u64, u64, usize)> = located
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| {
-            l.as_ref()
-                .ok()
-                .map(|(_, end)| (entries[i].local_offset, *end, i))
-        })
+        .filter_map(|(i, l)| l.as_ref().ok().map(|(_, end)| (local_offset(i), *end, i)))
         .collect();
     spans.sort_unstable();
     let mut out = vec![None; located.len()];
@@ -277,7 +322,9 @@ fn find_overlaps(entries: &[CentralEntry], located: &[Located]) -> Vec<Option<us
     out
 }
 
-fn compare_headers(e: &CentralEntry, lh: &LocalHeader, msgs: &mut Vec<String>) {
+/// Disagreements between the local header and the central record (name,
+/// method, encryption, and, without a data descriptor, CRC and sizes).
+pub(crate) fn compare_headers(e: &CentralEntry, lh: &LocalHeader, msgs: &mut Vec<String>) {
     if lh.raw_name != e.raw_name {
         msgs.push(format!(
             "local header name \"{}\" differs from the central directory",
@@ -372,7 +419,7 @@ fn delta(after: u64, before: u64) -> usize {
     (after.wrapping_sub(before) & 0xFFFF_FFFF) as usize
 }
 
-impl Checker<'_> {
+impl Meter<'_> {
     fn check_cancel(&self) -> std::result::Result<(), Stop> {
         if self.cancel.load(Ordering::Relaxed) {
             Err(Stop::Cancelled)
@@ -392,7 +439,9 @@ impl Checker<'_> {
         }
         self.check_cancel()
     }
+}
 
+impl Checker<'_> {
     fn check_entry(
         &mut self,
         e: &CentralEntry,
@@ -403,129 +452,155 @@ impl Checker<'_> {
             msgs.push(m);
             return Ok(());
         }
-        let r = if e.method == METHOD_STORED {
-            self.check_stored(e, lh.data_start)?
-        } else {
-            self.check_deflated(e, lh.data_start)?
-        };
-        if let Some(m) = r.problem {
-            msgs.push(m);
-            return Ok(());
-        }
-        if r.size != e.uncompressed {
-            msgs.push(format!(
-                "size mismatch: {} bytes of data, the central directory says {}",
-                r.size, e.uncompressed
-            ));
-        }
-        if r.crc != e.crc {
-            msgs.push(format!(
-                "bad CRC-32: computed {:08x}, the central directory says {:08x}",
-                r.crc, e.crc
-            ));
-        }
+        let meter = &mut self.meter;
+        let r = decode(
+            e,
+            &self.src.file,
+            lh.data_start,
+            &mut self.bufs,
+            &mut |chunk| meter.advance(chunk.len()),
+        )?;
+        msgs.extend(r.mismatch(e));
         Ok(())
     }
+}
 
-    fn check_stored(
-        &mut self,
-        e: &CentralEntry,
-        start: u64,
-    ) -> std::result::Result<DataCheck, Stop> {
-        self.src.file.seek(SeekFrom::Start(start))?;
-        let mut h = crc32fast::Hasher::new();
-        let mut left = e.compressed;
-        while left > 0 {
-            let n = left.min(BUF_LEN as u64) as usize;
-            self.src.file.read_exact(&mut self.inbuf[..n])?;
-            h.update(&self.inbuf[..n]);
-            left -= n as u64;
-            self.advance(n)?;
-        }
-        Ok(DataCheck {
-            crc: h.finalize(),
-            size: e.compressed,
-            problem: None,
-        })
+/// Decode `e`'s data (Stored or Deflate; the caller has checked
+/// [`verifiable`]), which starts at `start` in `file`, passing the
+/// uncompressed bytes to `sink` in order, in pieces of at most [`BUF_LEN`].
+///
+/// Deflate is inflated in [`BUF_LEN`] buffers and stopped as soon as it
+/// produces more than the declared size; bytes past the declared size never
+/// reach `sink` (so an extracted file can't grow past what the central
+/// directory promised). Damage is reported in [`DataCheck::problem`]; `Err`
+/// is only for read failures, sink failures and cancellation (which `sink`
+/// signals by returning [`Stop::Cancelled`]).
+///
+/// Reads are positional, so several threads may decode from one `file`.
+pub(crate) fn decode(
+    e: &CentralEntry,
+    file: &File,
+    start: u64,
+    bufs: &mut Buffers,
+    sink: &mut dyn FnMut(&[u8]) -> std::result::Result<(), Stop>,
+) -> std::result::Result<DataCheck, Stop> {
+    let mut data = SpanReader::new(file, start, e.compressed);
+    if e.method == METHOD_STORED {
+        decode_stored(e, &mut data, bufs, sink)
+    } else {
+        decode_deflated(e, &mut data, bufs, sink)
     }
+}
 
-    fn check_deflated(
-        &mut self,
-        e: &CentralEntry,
-        start: u64,
-    ) -> std::result::Result<DataCheck, Stop> {
-        let mut h = crc32fast::Hasher::new();
-        let mut out_total = 0u64;
-        if e.compressed == 0 {
-            // Some writers store empty files as zero bytes of "deflate".
+fn decode_stored(
+    e: &CentralEntry,
+    data: &mut SpanReader<'_>,
+    bufs: &mut Buffers,
+    sink: &mut dyn FnMut(&[u8]) -> std::result::Result<(), Stop>,
+) -> std::result::Result<DataCheck, Stop> {
+    let mut h = crc32fast::Hasher::new();
+    let mut left = e.compressed;
+    let mut size = 0u64;
+    while left > 0 {
+        let n = left.min(BUF_LEN as u64) as usize;
+        data.read_exact(&mut bufs.inbuf[..n])?;
+        left -= n as u64;
+        size += n as u64;
+        if size > e.uncompressed {
+            // Longer than declared: report it without handing the sink more
+            // than the entry says it holds.
             return Ok(DataCheck {
-                crc: 0,
-                size: 0,
-                problem: None,
+                crc: h.finalize(),
+                size: e.compressed,
+                problem: Some(format!(
+                    "size mismatch: {} bytes of data, the central directory says {}",
+                    e.compressed, e.uncompressed
+                )),
             });
         }
-        self.src.file.seek(SeekFrom::Start(start))?;
-        let mut left = e.compressed;
-        let mut inf = Inflate::new(false, WINDOW_BITS);
-        let (mut in_pos, mut in_len) = (0usize, 0usize);
-        let problem = loop {
-            if in_pos == in_len && left > 0 {
-                let n = left.min(BUF_LEN as u64) as usize;
-                self.src.file.read_exact(&mut self.inbuf[..n])?;
-                left -= n as u64;
-                in_pos = 0;
-                in_len = n;
-            }
-            let (bi, bo) = (inf.total_in(), inf.total_out());
-            let r = inf.decompress(
-                &self.inbuf[in_pos..in_len],
-                &mut self.outbuf,
-                InflateFlush::NoFlush,
-            );
-            let consumed = delta(inf.total_in(), bi).min(in_len - in_pos);
-            let produced = delta(inf.total_out(), bo).min(self.outbuf.len());
-            in_pos += consumed;
-            if produced > 0 {
-                h.update(&self.outbuf[..produced]);
-                out_total += produced as u64;
-                self.advance(produced)?;
-                if out_total > e.uncompressed {
-                    break Some(format!(
-                        "decompresses to more than the {} bytes the central directory \
-                         declares (stopped; possible zip bomb)",
-                        e.uncompressed
-                    ));
-                }
-            }
-            match r {
-                Ok(Status::StreamEnd) => {
-                    let extra = (in_len - in_pos) as u64 + left;
-                    break (extra > 0).then(|| {
-                        format!("{extra} bytes of unexpected data after the compressed stream")
-                    });
-                }
-                Ok(Status::Ok | Status::BufError) => {
-                    if consumed == 0 && produced == 0 {
-                        if in_pos == in_len && left == 0 {
-                            break Some(
-                                "compressed data ends before the end of the deflate stream \
-                                 (truncated or damaged)"
-                                    .into(),
-                            );
-                        }
-                        break Some("inflate made no progress (damaged data)".into());
-                    }
-                }
-                Err(err) => {
-                    let msg = inf.error_message().unwrap_or(err.as_str());
-                    break Some(format!("invalid compressed data: {msg}"));
-                }
-            }
-        };
-        Ok(DataCheck {
-            crc: h.finalize(),
-            size: out_total,
-            problem,
-        })
+        h.update(&bufs.inbuf[..n]);
+        sink(&bufs.inbuf[..n])?;
     }
+    Ok(DataCheck {
+        crc: h.finalize(),
+        size,
+        problem: None,
+    })
+}
+
+fn decode_deflated(
+    e: &CentralEntry,
+    data: &mut SpanReader<'_>,
+    bufs: &mut Buffers,
+    sink: &mut dyn FnMut(&[u8]) -> std::result::Result<(), Stop>,
+) -> std::result::Result<DataCheck, Stop> {
+    let mut h = crc32fast::Hasher::new();
+    let mut out_total = 0u64;
+    if e.compressed == 0 {
+        // Some writers store empty files as zero bytes of "deflate".
+        return Ok(DataCheck {
+            crc: 0,
+            size: 0,
+            problem: None,
+        });
+    }
+    let Buffers { inbuf, outbuf } = bufs;
+    let mut left = e.compressed;
+    let mut inf = Inflate::new(false, WINDOW_BITS);
+    let (mut in_pos, mut in_len) = (0usize, 0usize);
+    let problem = loop {
+        if in_pos == in_len && left > 0 {
+            let n = left.min(BUF_LEN as u64) as usize;
+            data.read_exact(&mut inbuf[..n])?;
+            left -= n as u64;
+            in_pos = 0;
+            in_len = n;
+        }
+        let (bi, bo) = (inf.total_in(), inf.total_out());
+        let r = inf.decompress(&inbuf[in_pos..in_len], outbuf, InflateFlush::NoFlush);
+        let consumed = delta(inf.total_in(), bi).min(in_len - in_pos);
+        let produced = delta(inf.total_out(), bo).min(outbuf.len());
+        in_pos += consumed;
+        if produced > 0 {
+            out_total += produced as u64;
+            if out_total > e.uncompressed {
+                break Some(format!(
+                    "decompresses to more than the {} bytes the central directory \
+                     declares (stopped; possible zip bomb)",
+                    e.uncompressed
+                ));
+            }
+            h.update(&outbuf[..produced]);
+            sink(&outbuf[..produced])?;
+        }
+        match r {
+            Ok(Status::StreamEnd) => {
+                let extra = (in_len - in_pos) as u64 + left;
+                break (extra > 0).then(|| {
+                    format!("{extra} bytes of unexpected data after the compressed stream")
+                });
+            }
+            Ok(Status::Ok | Status::BufError) => {
+                if consumed == 0 && produced == 0 {
+                    if in_pos == in_len && left == 0 {
+                        break Some(
+                            "compressed data ends before the end of the deflate stream \
+                             (truncated or damaged)"
+                                .into(),
+                        );
+                    }
+                    break Some("inflate made no progress (damaged data)".into());
+                }
+            }
+            Err(err) => {
+                let msg = inf.error_message().unwrap_or(err.as_str());
+                break Some(format!("invalid compressed data: {msg}"));
+            }
+        }
+    };
+    Ok(DataCheck {
+        crc: h.finalize(),
+        size: out_total,
+        problem,
+    })
 }
