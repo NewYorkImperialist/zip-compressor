@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 mod codec;
 mod container;
+mod detect;
 mod diff;
 mod extract;
 mod list;
@@ -30,6 +31,13 @@ mod zopfli_codec;
 ///
 /// Whatever the method, an entry is never written larger than storing it
 /// (beyond the documented chunk overhead for big files).
+///
+/// With [`CompressOptions::store_incompressible`] (the default), every
+/// compressing method, Best and Zopfli included, stores the data that option
+/// detects as incompressible instead of encoding it. Detection looks only at
+/// the data, so every method stores exactly the same files and chunks, and
+/// the "never larger than" comparisons below hold between methods run with
+/// the same setting of that option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     /// No compression.
@@ -43,7 +51,8 @@ pub enum Method {
     ///
     /// "Small" means a file under 1 MiB, compressed whole; anything bigger,
     /// and every chunk of a file of 4 MiB or more, is one level-9 pass. Ties
-    /// go to plain level 9. Never larger than `Deflate { level: 9 }`, file by file.
+    /// go to plain level 9. Never larger than `Deflate { level: 9 }`, file by
+    /// file (with the same `store_incompressible`).
     DeflateBest,
     /// Deflate produced by the Zopfli optimizer: same format as
     /// [`Method::Deflate`], typically 3-8% smaller, but far slower.
@@ -52,7 +61,7 @@ pub enum Method {
     ///
     /// Each unit also gets everything [`Method::DeflateBest`] tries and keeps
     /// the smallest result, so it is never larger than level 9 (or
-    /// `DeflateBest`) unit by unit.
+    /// `DeflateBest`) unit by unit (with the same `store_incompressible`).
     /// Units that level 9 shrinks by less than 0.1% skip Zopfli entirely.
     Zopfli { iterations: u16 },
 }
@@ -128,9 +137,30 @@ pub struct CompressOptions {
     /// apply to their own subtree, as in git). `.git/` itself is left out too.
     pub respect_gitignore: bool,
     /// Store (rather than deflate) file data that compression can't usefully
-    /// shrink, such as JPEG, MP4 or ZIP data, detected from the data itself
-    /// (never from the file name alone). Saves time; must not make archives
-    /// meaningfully larger. When false, every file goes through `method`.
+    /// shrink, such as most JPEG and HEIC photos, encrypted or random data,
+    /// detected from the data itself (never from the file name). Saves time;
+    /// must not make archives meaningfully larger. When false, every file
+    /// goes through `method`.
+    ///
+    /// Detection deflates a few 32 KiB samples of the data at a fast level
+    /// (its head, its tail and evenly spread ones, a quarter of it or less)
+    /// and stores the data when they show an estimated saving under 0.25%.
+    /// It applies to files of 512 KiB or more (smaller ones are always tried
+    /// with `method`). A file of 4 MiB or more is Stored only if it looks
+    /// incompressible throughout (first and last MiB, plus one sample per
+    /// MiB in between, up to 64); otherwise it is deflated, and each of its
+    /// 1 MiB chunks that looks incompressible on its own becomes stored
+    /// blocks inside the deflate stream (5 bytes per 64 KiB) without being
+    /// tried. Already-compressed data such as MP4 video or JAR/ZIP archives
+    /// usually deflates by 1-15% more (container headers, indexes, central
+    /// directories) and is then kept deflated.
+    ///
+    /// Measured against `false` on photos, video, PNGs, JARs, app bundles,
+    /// source trees and Silesia (docs/benchmarks.md): archives at most 0.05%
+    /// larger (text and source not at all); 2.5x less CPU on photos, 1.5x on
+    /// video, 8x on random data.
+    /// Decisions depend only on the file's bytes, never on `method` or
+    /// `threads`, so archives stay deterministic.
     pub store_incompressible: bool,
     /// Worker threads for compression. `0` means one per available CPU core.
     /// The archive bytes are identical whatever this is set to.

@@ -20,7 +20,11 @@ this rule, including the slowest.
 | `max` | Zopfli, 15 iterations (still plain Deflate) | Smallest file that still opens anywhere. **Much slower**, often 50–100x slower than `best`, for typically 3–8% smaller output. For archiving or sending large text/code. |
 
 Already-compressed data (photos, video, archives) is never made larger: an
-entry that does not shrink is stored as is.
+entry that does not shrink is stored as is. Data that deflate can't usefully
+shrink at all (most photos, encrypted or random data) is detected from a few
+samples and stored without trying (2.5x less CPU on photos, 8x on random
+data); on real photos, video, JARs and app bundles this costs at most 0.05%
+in size (details in [docs/benchmarks.md](docs/benchmarks.md)).
 
 <!-- phase3-numbers -->
 Measured on an Apple M1 (8 cores), best of 3 runs; full table in

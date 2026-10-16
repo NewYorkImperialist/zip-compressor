@@ -89,12 +89,12 @@ fn edge_tree(parent: &Path) -> (PathBuf, Vec<(&'static str, CompressionMethod)>)
     let mut mixed = compressible_bytes(MIB);
     mixed.extend(random_bytes(5 * MIB, 8));
     put("h_mixed_6m.bin", mixed, Some(Deflated));
-    // First MiB random, rest compressible: the probe sees < 0.5% savings,
-    // so the whole file is stored.
+    // First MiB random, rest compressible: deflated (the first chunk as
+    // stored blocks); only a file incompressible throughout is Stored.
     let mut rthenc = random_bytes(MIB, 9);
     rthenc.extend(compressible_bytes(4 * MIB));
-    put("i_rand_then_text_5m.bin", rthenc, Some(Stored));
-    // Fully random 6 MiB: probe -> stored.
+    put("i_rand_then_text_5m.bin", rthenc, Some(Deflated));
+    // Fully random 6 MiB: detected incompressible -> stored.
     put("j_rand_6m.bin", random_bytes(6 * MIB, 10), Some(Stored));
     // All zeros, 8 MiB: chunks compress to almost nothing.
     put("k_zeros_8m.bin", vec![0u8; 8 * MIB], Some(Deflated));
