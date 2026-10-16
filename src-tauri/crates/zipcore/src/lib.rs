@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 mod codec;
 mod container;
+mod diff;
 mod extract;
 mod list;
 mod output;
@@ -117,6 +118,20 @@ pub struct CompressOptions {
     pub symlinks: SymlinkPolicy,
     /// Leave out OS clutter: `.DS_Store`, `__MACOSX/`, AppleDouble `._*`, `Thumbs.db`, `desktop.ini`.
     pub exclude_junk: bool,
+    /// Leave out descendants matching any of these gitignore-style patterns
+    /// (`*.log`, `target/`, `/build`, `**/node_modules`), matched against the
+    /// path relative to the input they were found under. Like `exclude_junk`,
+    /// never applied to an input named explicitly. An excluded directory is
+    /// not descended into.
+    pub exclude: Vec<String>,
+    /// Also honor `.gitignore` files found inside the inputs (nested ones
+    /// apply to their own subtree, as in git). `.git/` itself is left out too.
+    pub respect_gitignore: bool,
+    /// Store (rather than deflate) file data that compression can't usefully
+    /// shrink, such as JPEG, MP4 or ZIP data, detected from the data itself
+    /// (never from the file name alone). Saves time; must not make archives
+    /// meaningfully larger. When false, every file goes through `method`.
+    pub store_incompressible: bool,
     /// Worker threads for compression. `0` means one per available CPU core.
     /// The archive bytes are identical whatever this is set to.
     pub threads: usize,
@@ -128,6 +143,9 @@ impl Default for CompressOptions {
             method: Method::default(),
             symlinks: SymlinkPolicy::default(),
             exclude_junk: true,
+            exclude: Vec::new(),
+            respect_gitignore: false,
+            store_incompressible: true,
             threads: 0,
         }
     }
@@ -406,6 +424,97 @@ pub fn extract_archive(
     cancel: &AtomicBool,
 ) -> Result<ExtractSummary> {
     extract::extract_archive(path, dest, opts, progress, cancel)
+}
+
+/// How one path compares between an archive and a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// Same kind and same contents (and mode/mtime, if those are compared).
+    Same,
+    /// Both are files (or both symlinks) but contents differ.
+    Different,
+    /// Contents match but the compared metadata (mode or mtime) differs.
+    MetadataDiffers,
+    /// One side is a file, the other a directory or symlink.
+    TypeMismatch,
+    OnlyInArchive,
+    OnlyOnDisk,
+}
+
+/// One path in a [`DiffReport`] (archive-style path, forward slashes,
+/// relative to the compared roots; directories end in `/`).
+#[derive(Debug, Clone)]
+pub struct DiffEntry {
+    pub path: String,
+    pub kind: DiffKind,
+    /// Human-readable specifics, e.g. "size 120 vs 118" or "mode 0644 vs 0600".
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffOptions {
+    /// Archive path prefix that corresponds to the directory. `None`: if every
+    /// entry is under `<directory name>/` (what `compress dir` produces), use
+    /// that; otherwise the archive root.
+    pub prefix: Option<String>,
+    /// Decompress and compare bytes instead of comparing size and CRC-32.
+    pub full: bool,
+    /// Also report Unix permission differences (when the archive has them).
+    pub compare_mode: bool,
+    /// Also report modification-time differences (2-second DOS tolerance
+    /// unless the archive has an exact extended timestamp).
+    pub compare_mtime: bool,
+    /// Ignore OS clutter on disk the same way `CompressOptions::exclude_junk` does.
+    pub exclude_junk: bool,
+    /// Gitignore-style patterns ignored on both sides.
+    pub exclude: Vec<String>,
+    /// Worker threads for hashing/decompressing. `0` means one per core.
+    pub threads: usize,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            prefix: None,
+            full: false,
+            compare_mode: false,
+            compare_mtime: false,
+            exclude_junk: true,
+            exclude: Vec::new(),
+            threads: 0,
+        }
+    }
+}
+
+/// Result of [`diff_archive`].
+#[derive(Debug, Clone)]
+pub struct DiffReport {
+    /// Every compared path, sorted, including `Same` ones.
+    pub entries: Vec<DiffEntry>,
+    /// The prefix actually used (see [`DiffOptions::prefix`]).
+    pub prefix: String,
+    pub elapsed: Duration,
+}
+
+impl DiffReport {
+    /// True when every entry is [`DiffKind::Same`].
+    pub fn is_identical(&self) -> bool {
+        self.entries.iter().all(|e| e.kind == DiffKind::Same)
+    }
+}
+
+/// Compare the archive at `archive` with the directory `dir`: which paths
+/// match, differ, or exist on one side only. Reads both sides, writes nothing.
+/// Damaged archive entries are reported as `Different` with a detail rather
+/// than failing the whole comparison.
+pub fn diff_archive(
+    archive: &Path,
+    dir: &Path,
+    opts: &DiffOptions,
+    progress: &mut dyn FnMut(&Progress),
+    cancel: &AtomicBool,
+) -> Result<DiffReport> {
+    diff::diff_archive(archive, dir, opts, progress, cancel)
 }
 
 /// A wall-clock date and time in the local time zone, as returned by
