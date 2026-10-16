@@ -52,8 +52,6 @@ impl Patterns {
         Ok(Patterns { gi })
     }
 
-    // For `DiffOptions::exclude` (archive entries have no walk to prune).
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.gi.is_empty()
     }
@@ -77,8 +75,6 @@ impl Patterns {
     /// Whether `rel` or any of its parent directories is excluded: the same
     /// answer a walk that skips excluded directories gives, for a flat list
     /// of paths (e.g. archive entries).
-    // For `DiffOptions::exclude` (archive entries have no walk to prune).
-    #[allow(dead_code)]
     pub(crate) fn excludes_path_or_parent(&self, rel: &Path, is_dir: bool) -> bool {
         if self.is_empty() {
             return false;
@@ -94,8 +90,6 @@ impl Patterns {
     /// [`Patterns::excludes_path_or_parent`] for an archive entry name
     /// (forward slashes; directories end in `/`), relative to the root the
     /// patterns apply to.
-    // For `DiffOptions::exclude` (archive entries have no walk to prune).
-    #[allow(dead_code)]
     pub(crate) fn excludes_archive_name(&self, name: &str) -> bool {
         let is_dir = name.ends_with('/');
         let rel = name.trim_end_matches('/');
