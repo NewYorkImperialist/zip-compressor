@@ -62,6 +62,7 @@ from `src-tauri/`; the binary is `src-tauri/target/release/zipc`.
 zipc compress project/ notes.txt -o out.zip              # balanced
 zipc compress project/ -o out.zip --preset max           # smallest, slow
 zipc compress photos/ -o photos.zip -p fast -t 4 --force
+zipc compress repo/ -o src.zip --gitignore -x '*.log'     # skip ignored files and .git/
 ```
 
 Options for `zipc compress`:
@@ -75,6 +76,21 @@ Options for `zipc compress`:
 - `--symlinks store|follow|skip` — how to treat symbolic links (default `store`).
 - `--keep-junk` — keep `.DS_Store`, `__MACOSX/`, `._*`, `Thumbs.db` and
   `desktop.ini` (they are left out by default).
+- `-x, --exclude PATTERN` — leave out what matches PATTERN, in `.gitignore`
+  syntax (`*.log`, `node_modules/`, `/build`, `docs/**/*.tmp`, `!keep.log`),
+  matched against paths relative to each input. Repeatable; later patterns
+  win. An excluded folder is not looked into, and inputs named on the command
+  line are always included. Case-insensitive on Windows, as git is there.
+- `--gitignore` — also honor `.gitignore` files inside the inputs (a nested
+  one applies to its own folder, as in git) and leave out `.git/`.
+  `--exclude` patterns apply on top: a `.gitignore` `!` line can't bring back
+  what `--exclude` left out.
+- `--compress-all` — deflate every file, even data that won't shrink (slower).
+  By default data that compression can't shrink (JPEG, MP4, ZIP...) is stored.
+- `--json` — print the summary as one JSON object (`output`, `files`, `dirs`,
+  `symlinks`, `bytes_in`, `bytes_out`, `ratio` = out/in, `elapsed_seconds`,
+  `preset`, `method`, `level`, `iterations`, `threads`) and no progress.
+  Errors go to stderr with exit status 1 and nothing on stdout.
 - `-q, --quiet` — no progress line.
 - Advanced overrides, which cannot be combined with `--preset` or each other:
   `-l, --level 0-9` (plain Deflate), `--store` (no compression), and

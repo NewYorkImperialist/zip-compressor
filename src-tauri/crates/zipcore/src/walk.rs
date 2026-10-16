@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 use walkdir::WalkDir;
 
+use crate::filter::{Patterns, TreeFilter};
 use crate::{CompressOptions, Error, Result, SymlinkPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +153,9 @@ fn follow_links(policy: SymlinkPolicy) -> bool {
 /// - Each input is listed under its own name; children are sorted by file name.
 /// - An input that is itself a symlink is always resolved (the user named it
 ///   explicitly); the policy applies to links found inside directories.
-/// - `exclude_junk` applies to descendants only, never to an input named explicitly.
+/// - `exclude_junk`, `exclude` and `respect_gitignore` apply to descendants
+///   only, never to an input named explicitly (see `filter::TreeFilter`); an
+///   excluded directory is not descended into.
 /// - Sockets, FIFOs and device nodes are skipped (reading a FIFO would block).
 /// - With `Follow`, links that would re-enter an ancestor directory (cycles) are
 ///   skipped; a dangling link is an error.
@@ -163,6 +166,7 @@ pub(crate) fn scan(
 ) -> Result<Vec<Entry>> {
     let follow = follow_links(opts.symlinks);
     let mut seen: HashSet<String> = HashSet::new();
+    let exclude = Patterns::new(&opts.exclude)?;
     let mut entries = Vec::new();
 
     for input in inputs {
@@ -187,15 +191,14 @@ pub(crate) fn scan(
             return Err(Error::DuplicateName(top));
         }
 
-        let exclude_junk = opts.exclude_junk;
-        let walker = WalkDir::new(input)
+        let mut filter = TreeFilter::new(&exclude, opts.exclude_junk, opts.respect_gitignore);
+        let mut walker = WalkDir::new(input)
             .follow_links(follow)
             .follow_root_links(true)
             .sort_by_file_name()
-            .into_iter()
-            .filter_entry(move |e| !(exclude_junk && e.depth() > 0 && is_junk(e.file_name())));
+            .into_iter();
 
-        for item in walker {
+        while let Some(item) = walker.next() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(Error::Cancelled);
             }
@@ -206,6 +209,17 @@ pub(crate) fn scan(
             };
             let ft = dent.file_type();
             let rel = dent.path().strip_prefix(input).unwrap_or(Path::new(""));
+            if !filter.keep(rel, dent.depth(), ft.is_dir()) {
+                // Don't look inside: whatever the directory holds (even
+                // unreadable subdirectories) stays out of the archive.
+                if ft.is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+            if ft.is_dir() {
+                filter.enter_dir(dent.path(), rel, dent.depth())?;
+            }
             let name = archive_name(&top, rel);
 
             let kind = if ft.is_dir() {
