@@ -406,3 +406,31 @@ pub fn extract_archive(
 ) -> Result<ExtractSummary> {
     extract::extract_archive(path, dest, opts, progress, cancel)
 }
+
+/// A wall-clock date and time in the local time zone, as returned by
+/// [`local_time`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: i64,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+/// `t` as local wall-clock time, using the zone rules (UTC offset and daylight
+/// saving) in force at that instant: the conversion used for the DOS time
+/// fields, offered so front ends can display [`EntryInfo::modified`] the same
+/// way. Falls back to UTC where the local zone can't be determined.
+pub fn local_time(t: std::time::SystemTime) -> LocalTime {
+    let c = timeconv::civil_from_unix_local(timeconv::unix_secs(t));
+    LocalTime {
+        year: c.year,
+        month: c.month,
+        day: c.day,
+        hour: c.hour,
+        minute: c.minute,
+        second: c.second,
+    }
+}
