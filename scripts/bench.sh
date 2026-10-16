@@ -209,6 +209,12 @@ fi
 
 if ((WRITE_DOCS)); then
   mkdir -p "$(dirname "$DOCS")"
+  # Hand-written sections after this marker survive a rewrite.
+  KEEP_MARK='<!-- kept by scripts/bench.sh: everything below is preserved -->'
+  KEPT=""
+  if [[ -f "$DOCS" ]] && grep -qF "$KEEP_MARK" "$DOCS"; then
+    KEPT="$(awk -v m="$KEEP_MARK" 'f || $0 == m { f = 1; print }' "$DOCS")"
+  fi
   zip_ver="$(zip -v 2>/dev/null | sed -n 's/^This is \(Zip [0-9.]*\).*/\1/p' | head -n1)"
   {
     printf '# Benchmarks\n\n'
@@ -241,6 +247,7 @@ Built by `scripts/fetch-corpus.sh` into `bench-data/` (gitignored):
 - **big** — a 1 GiB file of lightly mutated slices of source/ and silesia/, plus 256 MiB of seeded random bytes.
 - **photos** — macOS wallpapers (HEIC/JPG, up to 50 MB); already-compressed data.
 EOF
+    if [[ -n "$KEPT" ]]; then printf '\n%s\n' "$KEPT"; fi
   } >"$DOCS"
   log "wrote $DOCS"
 fi
