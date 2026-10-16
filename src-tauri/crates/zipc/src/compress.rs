@@ -1,12 +1,13 @@
 //! `zipc compress`.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
 use zipcore::{CompressOptions, Error, Method, Preset, Summary, SymlinkPolicy};
 
+use crate::json::{Object, Value};
 use crate::progress::{install_cancel_handler, ProgressLine};
 use crate::units::{format_bytes, format_duration, ratio_percent, throughput_mb_s};
 use crate::Outcome;
@@ -63,9 +64,27 @@ pub struct CompressArgs {
     #[arg(long)]
     keep_junk: bool,
 
+    /// Leave out files and folders matching PATTERN (gitignore syntax, matched
+    /// relative to each input; repeatable): -x '*.log' -x node_modules/ -x /build.
+    /// Inputs named on the command line are always included.
+    #[arg(short = 'x', long = "exclude", value_name = "PATTERN")]
+    exclude: Vec<String>,
+
+    /// Also leave out what .gitignore files inside the inputs ignore, and .git/ itself.
+    #[arg(long)]
+    gitignore: bool,
+
+    /// Deflate every file, even data that won't shrink (slower).
+    #[arg(long, conflicts_with = "store")]
+    compress_all: bool,
+
     /// Do not show progress.
     #[arg(short, long)]
     quiet: bool,
+
+    /// Print the summary as one JSON object (and no progress).
+    #[arg(long)]
+    json: bool,
 
     /// Overwrite the output archive if it already exists.
     #[arg(short, long)]
@@ -167,8 +186,10 @@ impl CompressArgs {
             method: self.choice().method(),
             symlinks: self.symlinks.into(),
             exclude_junk: !self.keep_junk,
+            exclude: self.exclude.clone(),
+            respect_gitignore: self.gitignore,
+            store_incompressible: !self.compress_all,
             threads: self.threads,
-            ..CompressOptions::default()
         }
     }
 }
@@ -187,7 +208,7 @@ pub fn run(args: CompressArgs) -> Result<Outcome> {
 
     let cancel = install_cancel_handler()?;
 
-    let show_progress = !args.quiet && std::io::stderr().is_terminal();
+    let show_progress = !args.quiet && !args.json && std::io::stderr().is_terminal();
     let mut bar = ProgressLine::new(show_progress, "files");
     let result = zipcore::compress_to_path(
         &args.inputs,
@@ -200,7 +221,15 @@ pub fn run(args: CompressArgs) -> Result<Outcome> {
 
     match result {
         Ok(summary) => {
-            print_summary(&summary, effective_threads(args.threads), args.choice());
+            let threads = effective_threads(args.threads);
+            if args.json {
+                println!(
+                    "{}",
+                    summary_json(&args.output, &summary, threads, args.choice())
+                );
+            } else {
+                print_summary(&summary, threads, args.choice());
+            }
             Ok(Outcome::Ok)
         }
         Err(Error::Cancelled) => Ok(Outcome::Cancelled),
@@ -239,4 +268,76 @@ fn print_summary(s: &Summary, threads: usize, choice: Choice) {
         format_duration(s.elapsed),
         choice.describe()
     );
+}
+
+/// `--json`: one object. `ratio` is `bytes_out / bytes_in` (null for empty
+/// input); `preset` is null for an explicit method override; `level` is set
+/// for Deflate and `iterations` for Zopfli.
+fn summary_json(output: &Path, s: &Summary, threads: usize, choice: Choice) -> String {
+    let ratio =
+        ratio_percent(s.bytes_in, s.bytes_out).map_or(Value::Null, |r| Value::F64(r / 100.0));
+    let preset = match choice {
+        Choice::Preset(p) => Some(p.name()),
+        Choice::Custom(_) => None,
+    };
+    let (method, level, iterations) = match choice.method() {
+        Method::Store => ("store", None, None),
+        Method::Deflate { level } => ("deflate", Some(u64::from(level)), None),
+        Method::DeflateBest => ("deflate-best", None, None),
+        Method::Zopfli { iterations } => ("zopfli", None, Some(u64::from(iterations))),
+    };
+    Object::new()
+        .field("output", output.to_string_lossy().as_ref())
+        .field("files", s.files)
+        .field("dirs", s.dirs)
+        .field("symlinks", s.symlinks)
+        .field("bytes_in", s.bytes_in)
+        .field("bytes_out", s.bytes_out)
+        .field("ratio", ratio)
+        .field("elapsed_seconds", Value::F64(s.elapsed.as_secs_f64()))
+        .field("preset", preset)
+        .field("method", method)
+        .field("level", level)
+        .field("iterations", iterations)
+        .field("threads", threads as u64)
+        .finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn json_summary() {
+        let s = Summary {
+            files: 2,
+            dirs: 1,
+            symlinks: 0,
+            bytes_in: 1000,
+            bytes_out: 250,
+            elapsed: Duration::from_millis(1500),
+        };
+        assert_eq!(
+            summary_json(
+                Path::new("o\".zip"),
+                &s,
+                4,
+                Choice::Preset(Preset::Balanced)
+            ),
+            r#"{"output":"o\".zip","files":2,"dirs":1,"symlinks":0,"bytes_in":1000,"bytes_out":250,"ratio":0.25,"elapsed_seconds":1.5,"preset":"balanced","method":"deflate","level":6,"iterations":null,"threads":4}"#
+        );
+        let empty = Summary { bytes_in: 0, ..s };
+        let j = summary_json(
+            Path::new("e.zip"),
+            &empty,
+            1,
+            Choice::Custom(Method::Zopfli { iterations: 7 }),
+        );
+        assert!(
+            j.contains(r#""ratio":null"#)
+                && j.contains(r#""preset":null,"method":"zopfli","level":null,"iterations":7"#),
+            "{j}"
+        );
+    }
 }
