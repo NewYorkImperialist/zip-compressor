@@ -70,6 +70,12 @@ use crate::{Error, ExtractOptions, ExtractSummary, Overwrite, Progress, Result};
 
 /// Longest symlink target accepted (Linux `PATH_MAX`; macOS allows 1024).
 const MAX_LINK_TARGET: u64 = 4096;
+/// Longest relative path an entry may extract to (Linux `PATH_MAX`; macOS
+/// stops at 1024 anyway). Refused up front: Windows long paths reach ~32,767
+/// characters, and creating a hostile 16,000-level tree one directory at a
+/// time by full path is quadratic, so without a cap such an archive would
+/// effectively hang there instead of failing.
+const MAX_ENTRY_PATH: usize = 4096;
 /// How often the main thread checks for byte progress while workers run.
 const POLL: Duration = Duration::from_millis(50);
 const METHOD_AES: u16 = 99;
@@ -418,6 +424,20 @@ fn plan_names<'a>(
         if comps.is_empty() && kind != Kind::Dir {
             // A file named "" or "./": it would replace the destination itself.
             return Err(Error::UnsafePath(e.name.clone()));
+        }
+        let len = comps.iter().map(|c| c.len() + 1).sum::<usize>();
+        if len > MAX_ENTRY_PATH {
+            let shown: String = e.name.chars().take(60).collect();
+            return Err(io_err(
+                dest,
+                io::Error::new(
+                    io::ErrorKind::InvalidFilename,
+                    format!(
+                        "entry `{shown}...` would be a {len}-byte path \
+                         (at most {MAX_ENTRY_PATH} allowed)"
+                    ),
+                ),
+            ));
         }
         all.push((e, kind, comps));
     }
