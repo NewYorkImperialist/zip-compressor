@@ -44,10 +44,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use walkdir::WalkDir;
 
 use crate::extract::split_name;
+use crate::filter::{Patterns, TreeFilter};
 use crate::reader::{self, extra_fields, CentralEntry};
 use crate::timeconv;
 use crate::verify::{self, Buffers, Located, Stop, BUF_LEN, PROGRESS_STEP};
@@ -157,7 +157,7 @@ pub(crate) fn diff_archive(
         }
         Err(e) => return Err(io_err(dir, e)),
     }
-    let exclude = build_exclude(&opts.exclude, dir)?;
+    let exclude = Patterns::new(&opts.exclude)?;
     let entries = &cd.entries;
 
     // Archive names as components; `None` for unsafe ones.
@@ -383,70 +383,30 @@ fn display(path: &str, dir: bool) -> String {
     }
 }
 
-/// The `exclude` patterns as one gitignore matcher, rooted at `.` so the
-/// relative paths given to it are matched as they are.
-fn build_exclude(patterns: &[String], dir: &Path) -> Result<Gitignore> {
-    let mut b = GitignoreBuilder::new(".");
-    for pat in patterns {
-        b.add_line(None, pat).map_err(|e| {
-            io_err(
-                dir,
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid exclude pattern `{pat}`: {e}"),
-                ),
-            )
-        })?;
-    }
-    b.build().map_err(|e| {
-        io_err(
-            dir,
-            io::Error::new(io::ErrorKind::InvalidInput, e.to_string()),
-        )
-    })
-}
-
-/// Whether `rel` (components relative to the compared root) is excluded: it,
-/// or one of the directories above it, matches. Checked top-down, the way the
-/// disk walk prunes, so a `!negation` cannot re-include something inside an
-/// excluded directory on one side only.
-fn excluded(exclude: &Gitignore, rel: &[&str], is_dir: bool) -> bool {
-    if exclude.is_empty() {
-        return false;
-    }
-    let mut path = PathBuf::new();
-    for (k, c) in rel.iter().enumerate() {
-        path.push(c);
-        let dir = k + 1 < rel.len() || is_dir;
-        if exclude.matched(&path, dir).is_ignore() {
-            return true;
-        }
-    }
-    false
+/// Whether `rel` (components relative to the compared root) is excluded:
+/// it, or one of the directories above it, matches. That is the answer the
+/// disk walk gives by not descending into excluded directories, so a
+/// `!negation` cannot re-include something on one side only.
+fn excluded(exclude: &Patterns, rel: &[&str], is_dir: bool) -> bool {
+    exclude.excludes_archive_name(&display(&rel.join("/"), is_dir))
 }
 
 fn walk_disk(
     dir: &Path,
     opts: &DiffOptions,
-    exclude: &Gitignore,
+    exclude: &Patterns,
     cancel: &AtomicBool,
     slots: &mut BTreeMap<String, Slot>,
 ) -> Result<()> {
-    let exclude_junk = opts.exclude_junk;
-    let walker = WalkDir::new(dir)
+    // The same filter `compress` applies, minus .gitignore files.
+    let mut filter = TreeFilter::new(exclude, opts.exclude_junk, false);
+    let mut walker = WalkDir::new(dir)
         .min_depth(1)
         .follow_links(false)
         .follow_root_links(true)
         .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| {
-            if exclude_junk && is_junk(e.file_name()) {
-                return false;
-            }
-            let rel = e.path().strip_prefix(dir).unwrap_or(e.path());
-            exclude.is_empty() || !exclude.matched(rel, e.file_type().is_dir()).is_ignore()
-        });
-    for item in walker {
+        .into_iter();
+    while let Some(item) = walker.next() {
         if cancel.load(Ordering::Relaxed) {
             return Err(Error::Cancelled);
         }
@@ -457,6 +417,17 @@ fn walk_disk(
                 source: io::Error::from(e),
             }
         })?;
+        let rel = dent.path().strip_prefix(dir).unwrap_or(dent.path());
+        let is_dir = dent.file_type().is_dir();
+        if !filter.keep(rel, dent.depth(), is_dir) {
+            if is_dir {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if is_dir {
+            filter.enter_dir(dent.path(), rel, dent.depth())?;
+        }
         let ft = dent.file_type();
         let kind = if ft.is_dir() {
             Kind::Dir
@@ -470,7 +441,6 @@ fn walk_disk(
         // Asked of the entry itself: on Windows the directory listing's
         // metadata can lag (see `walk::entry_metadata`).
         let md = fs::symlink_metadata(dent.path()).map_err(|e| io_err(dent.path(), e))?;
-        let rel = dent.path().strip_prefix(dir).unwrap_or(dent.path());
         let key = rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy())
@@ -856,24 +826,6 @@ fn rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exclusion_is_top_down() {
-        let g = build_exclude(
-            &["build/".into(), "*.log".into(), "!keep.log".into()],
-            Path::new("."),
-        )
-        .unwrap();
-        assert!(excluded(&g, &["build"], true));
-        assert!(excluded(&g, &["build", "x.txt"], false));
-        assert!(
-            !excluded(&g, &["build"], false),
-            "build/ only matches directories"
-        );
-        assert!(excluded(&g, &["a", "b.log"], false));
-        assert!(!excluded(&g, &["a", "keep.log"], false));
-        assert!(!excluded(&g, &["src", "main.rs"], false));
-    }
 
     #[test]
     fn display_marks_directories() {
