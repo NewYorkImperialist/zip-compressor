@@ -400,3 +400,388 @@ fn test_non_zip_exits_1() {
 fn test_without_archives_is_usage_error() {
     assert_eq!(zipc(["test"]).status.code(), Some(2));
 }
+
+// ---- zipc list ----
+
+/// `make_tree` compressed (with `extra` options) into `dir/NAME`.
+fn make_zip(dir: &Path, name: &str, extra: &[&str]) -> std::path::PathBuf {
+    let data = dir.join("data");
+    if !data.exists() {
+        make_tree(dir);
+    }
+    let zip = dir.join(name);
+    let out = compress_with(&data, &zip, extra);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    zip
+}
+
+const TREE_NAMES: [&str; 4] = ["data/", "data/a.txt", "data/sub/", "data/sub/b.txt"];
+
+#[test]
+fn list_prints_one_name_per_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let out = zipc([OsStr::new("list"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).lines().collect::<Vec<_>>(), TREE_NAMES);
+    assert!(stderr(&out).is_empty(), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn list_several_archives_has_headings() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = make_zip(dir.path(), "a.zip", &[]);
+    let b = make_zip(dir.path(), "b.zip", &["--store"]);
+    let out = zipc([OsStr::new("list"), a.as_os_str(), b.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with(&format!("{}:\n", a.display())), "{text}");
+    assert!(text.contains(&format!("\n\n{}:\n", b.display())), "{text}");
+    assert_eq!(text.lines().filter(|l| *l == "data/a.txt").count(), 2);
+}
+
+#[test]
+fn list_long_shows_a_table_and_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let out = zipc([OsStr::new("list"), OsStr::new("--long"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1 + TREE_NAMES.len() + 1, "{text}");
+    for col in ["Size", "Compressed", "Ratio", "Method", "Modified", "Name"] {
+        assert!(lines[0].contains(col), "header lacks {col}: {text}");
+    }
+    let a = lines.iter().find(|l| l.ends_with("  data/a.txt")).unwrap();
+    assert!(a.contains("1.2 KiB") && a.contains("Deflate"), "{a}");
+    // Local modified time, e.g. 2024-03-04 05:06:07.
+    assert!(
+        a.split_whitespace()
+            .any(|w| w.len() == 10 && w.as_bytes()[4] == b'-' && w.as_bytes()[7] == b'-'),
+        "{a}"
+    );
+    let b = lines
+        .iter()
+        .find(|l| l.ends_with("  data/sub/b.txt"))
+        .unwrap();
+    assert!(b.contains("5 B") && b.contains("Stored"), "{b}");
+    assert!(
+        lines
+            .last()
+            .unwrap()
+            .ends_with("2 files, 2 dirs, 0 symlinks"),
+        "{text}"
+    );
+
+    let short = zipc([OsStr::new("list"), OsStr::new("-l"), zip.as_os_str()]);
+    assert_eq!(stdout(&short), text);
+}
+
+fn parse_json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("invalid JSON ({e}): {text}"))
+}
+
+#[test]
+fn list_json_is_valid_and_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let out = zipc([OsStr::new("list"), OsStr::new("--json"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = parse_json(&stdout(&out));
+    assert_eq!(v["archive"], zip.to_str().unwrap());
+    assert_eq!(v["archive_bytes"], fs::metadata(&zip).unwrap().len());
+    assert_eq!(v["problems"], serde_json::json!([]));
+    let entries = v["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, TREE_NAMES);
+    let a = &entries[1];
+    assert_eq!(a["kind"], "file");
+    assert_eq!(a["method"], 8);
+    assert_eq!(a["uncompressed"], 1200);
+    assert!(a["compressed"].as_u64().unwrap() < 1200);
+    assert!(a["crc32"].is_u64());
+    assert_eq!(a["encrypted"], false);
+    let modified = a["modified"].as_str().unwrap();
+    assert!(
+        modified.len() == 20 && modified.ends_with('Z') && modified.as_bytes()[10] == b'T',
+        "not RFC 3339 UTC: {modified}"
+    );
+    assert_eq!(entries[0]["kind"], "dir");
+    if cfg!(unix) {
+        assert!(a["unix_mode"].as_str().unwrap().starts_with('0'), "{a}");
+    } else {
+        assert!(a["unix_mode"].is_null(), "{a}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn list_json_escapes_awkward_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("odd");
+    fs::create_dir_all(&data).unwrap();
+    let name = "quote\"back\\slash\ttab\u{1}é.txt";
+    fs::write(data.join(name), b"x").unwrap();
+    std::os::unix::fs::symlink("target", data.join("link")).unwrap();
+    let zip = dir.path().join("odd.zip");
+    let out = compress_with(&data, &zip, &[]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+
+    let out = zipc([OsStr::new("list"), OsStr::new("--json"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let v = parse_json(&stdout(&out));
+    let entries = v["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&format!("odd/{name}").as_str()), "{names:?}");
+    let link = entries.iter().find(|e| e["name"] == "odd/link").unwrap();
+    assert_eq!(link["kind"], "symlink");
+}
+
+#[test]
+fn list_json_several_archives_one_object_per_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = make_zip(dir.path(), "a.zip", &[]);
+    let b = make_zip(dir.path(), "b.zip", &["--store"]);
+    let out = zipc([
+        OsStr::new("list"),
+        OsStr::new("--json"),
+        a.as_os_str(),
+        b.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let docs: Vec<serde_json::Value> = text.lines().map(parse_json).collect();
+    assert_eq!(docs.len(), 2, "{text}");
+    assert_eq!(docs[1]["archive"], b.to_str().unwrap());
+    assert_eq!(docs[1]["entries"][1]["method"], 0);
+}
+
+#[test]
+fn list_bad_archives_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = make_zip(dir.path(), "good.zip", &[]);
+    let junk = dir.path().join("junk.zip");
+    fs::write(&junk, "definitely not a zip file\n".repeat(10)).unwrap();
+    let missing = dir.path().join("missing.zip");
+
+    let out = zipc([OsStr::new("list"), junk.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("not a valid ZIP archive"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stdout(&out).is_empty());
+
+    let out = zipc([
+        OsStr::new("list"),
+        OsStr::new("--json"),
+        missing.as_os_str(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("missing.zip"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty());
+
+    // The good archive is still listed.
+    let out = zipc([OsStr::new("list"), missing.as_os_str(), good.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stdout(&out).contains("data/sub/b.txt"), "{}", stdout(&out));
+}
+
+#[test]
+fn list_usage_errors() {
+    assert_eq!(zipc(["list"]).status.code(), Some(2));
+    assert_eq!(
+        zipc(["list", "--long", "--json", "a.zip"]).status.code(),
+        Some(2)
+    );
+}
+
+// ---- zipc extract ----
+
+#[test]
+fn extract_usage_errors() {
+    assert_eq!(zipc(["extract"]).status.code(), Some(2));
+    assert_eq!(
+        zipc(["extract", "a.zip", "--overwrite", "--skip-existing"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        zipc(["extract", "a.zip", "--threads", "many"])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(zipc(["extract", "a.zip", "--bogus"]).status.code(), Some(2));
+}
+
+#[test]
+fn extract_missing_archive_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.zip");
+    let out = zipc([OsStr::new("extract"), missing.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("not found"), "{}", stderr(&out));
+    assert!(!dir.path().join("missing").exists());
+
+    let out = zipc([OsStr::new("extract"), dir.path().as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("not a file"), "{}", stderr(&out));
+}
+
+fn list_dir_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn extract_refuses_existing_default_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("keep.txt"), b"mine").unwrap();
+
+    let out = zipc([OsStr::new("extract"), zip.as_os_str(), OsStr::new("-q")]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("already exists"), "{err}");
+    assert!(
+        err.contains("-d") && err.contains("--skip-existing"),
+        "{err}"
+    );
+    assert_eq!(list_dir_names(&dest), ["keep.txt"]);
+}
+
+#[test]
+#[ignore = "needs extract_archive"]
+fn extract_into_default_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let out = zipc([OsStr::new("extract"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let dest = dir.path().join("out");
+    assert_eq!(
+        fs::read(dest.join("data/a.txt")).unwrap(),
+        fs::read(dir.path().join("data/a.txt")).unwrap()
+    );
+    assert_eq!(fs::read(dest.join("data/sub/b.txt")).unwrap(), b"world");
+    let text = stdout(&out);
+    assert!(text.contains("2 files, 2 dirs, 0 symlinks"), "{text}");
+    assert!(text.contains(&format!("-> {}", dest.display())), "{text}");
+
+    // Again: the folder exists now, so a flag is needed.
+    let out = zipc([OsStr::new("extract"), zip.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    let out = zipc([
+        OsStr::new("extract"),
+        zip.as_os_str(),
+        OsStr::new("--skip-existing"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("2 skipped"), "{}", stdout(&out));
+}
+
+#[test]
+#[ignore = "needs extract_archive"]
+fn extract_dest_paths_and_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let dest = dir.path().join("chosen");
+    let out = zipc([
+        OsStr::new("extract"),
+        zip.as_os_str(),
+        OsStr::new("data/sub/"),
+        OsStr::new("-d"),
+        dest.as_os_str(),
+        OsStr::new("--json"),
+        OsStr::new("-j"),
+        OsStr::new("2"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(fs::read(dest.join("data/sub/b.txt")).unwrap(), b"world");
+    assert!(!dest.join("data/a.txt").exists());
+    let v = parse_json(&stdout(&out));
+    assert_eq!(v["dest"], dest.to_str().unwrap());
+    assert_eq!(v["archive"], zip.to_str().unwrap());
+    assert_eq!(v["files"], 1);
+    assert_eq!(v["skipped"], 0);
+    assert_eq!(v["bytes_out"], 5);
+    assert!(v["elapsed_seconds"].is_f64());
+}
+
+#[test]
+#[ignore = "needs extract_archive"]
+fn extract_existing_file_needs_a_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip = make_zip(dir.path(), "out.zip", &[]);
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(dest.join("data/sub")).unwrap();
+    fs::write(dest.join("data/sub/b.txt"), b"old").unwrap();
+    let run = |flag: Option<&str>| {
+        let mut args = vec![
+            OsStr::new("extract"),
+            zip.as_os_str(),
+            OsStr::new("-d"),
+            dest.as_os_str(),
+            OsStr::new("-q"),
+        ];
+        args.extend(flag.map(OsStr::new));
+        zipc(args)
+    };
+
+    let out = run(None);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("--overwrite"), "{}", stderr(&out));
+    assert_eq!(fs::read(dest.join("data/sub/b.txt")).unwrap(), b"old");
+    assert!(!dest.join("data/a.txt").exists(), "nothing written");
+
+    let out = run(Some("--skip-existing"));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(fs::read(dest.join("data/sub/b.txt")).unwrap(), b"old");
+    assert!(dest.join("data/a.txt").exists());
+
+    let out = run(Some("--overwrite"));
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(fs::read(dest.join("data/sub/b.txt")).unwrap(), b"world");
+}
+
+#[test]
+#[ignore = "needs extract_archive"]
+fn extract_corrupt_archive_exits_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let junk = dir.path().join("junk.zip");
+    fs::write(&junk, "definitely not a zip file\n".repeat(10)).unwrap();
+    let out = zipc([OsStr::new("extract"), junk.as_os_str()]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("not a valid ZIP archive"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn help_mentions_list_and_extract() {
+    let text = stdout(&zipc(["--help"]));
+    for word in ["list", "extract", "Exit status"] {
+        assert!(text.contains(word), "help lacks {word}: {text}");
+    }
+    let text = stdout(&zipc(["extract", "--help"]));
+    assert!(
+        text.contains("--skip-existing") && text.contains("photos/"),
+        "{text}"
+    );
+}
