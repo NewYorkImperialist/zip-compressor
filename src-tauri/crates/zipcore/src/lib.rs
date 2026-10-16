@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 mod codec;
 mod container;
+mod extract;
+mod list;
 mod output;
 mod reader;
 mod timeconv;
@@ -178,6 +180,22 @@ pub enum Error {
     DuplicateName(String),
     #[error("cancelled")]
     Cancelled,
+    /// An entry name that would land outside the destination: absolute,
+    /// containing `..`, a drive letter, or (on extract) a path through a
+    /// symlink. Nothing from such an archive is written.
+    #[error("unsafe entry name `{0}`: it would be written outside the destination")]
+    UnsafePath(String),
+    /// Extracting would replace an existing file and
+    /// [`Overwrite::Never`] is in effect.
+    #[error("{0} already exists (pass --overwrite to replace it)")]
+    AlreadyExists(PathBuf),
+    /// An entry that cannot be extracted: encrypted, or a compression method
+    /// other than Stored/Deflate.
+    #[error("cannot extract `{entry}`: {reason}")]
+    Unsupported { entry: String, reason: String },
+    /// An entry's data is damaged (bad CRC, wrong size, truncated stream).
+    #[error("`{entry}` is damaged: {reason}")]
+    Corrupt { entry: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -267,4 +285,153 @@ pub fn test_archive(
     cancel: &AtomicBool,
 ) -> Result<TestReport> {
     verify::test_archive(path, progress, cancel)
+}
+
+/// What kind of thing an archive entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+}
+
+/// One entry as listed by [`list_archive`], in central directory order.
+#[derive(Debug, Clone)]
+pub struct EntryInfo {
+    /// Archive path (forward slashes; directories end in `/`).
+    pub name: String,
+    pub kind: EntryKind,
+    /// Raw ZIP method number (0 = Stored, 8 = Deflate, ...).
+    pub method: u16,
+    pub compressed: u64,
+    pub uncompressed: u64,
+    pub crc32: u32,
+    /// Modification time: the 0x5455 extended timestamp when present (UTC),
+    /// otherwise the DOS date/time read as local time. `None` if invalid.
+    pub modified: Option<std::time::SystemTime>,
+    /// Unix permission bits (e.g. `0o644`) when the archive was made on Unix.
+    pub unix_mode: Option<u32>,
+    pub encrypted: bool,
+}
+
+/// Result of [`list_archive`].
+#[derive(Debug, Clone)]
+pub struct Listing {
+    pub entries: Vec<EntryInfo>,
+    /// Size of the archive file.
+    pub archive_bytes: u64,
+    /// Archive-level problems noticed while reading the directory (not fatal).
+    pub problems: Vec<String>,
+}
+
+/// Read an archive's central directory without decompressing anything.
+/// Works on archives from any tool. Fails only if the directory can't be read.
+pub fn list_archive(path: &Path) -> Result<Listing> {
+    list::list_archive(path)
+}
+
+/// What to do when an extracted file already exists at the destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overwrite {
+    /// Fail with [`Error::AlreadyExists`] before writing anything. Default.
+    #[default]
+    Never,
+    /// Leave existing files alone and extract the rest (counted as skipped).
+    Skip,
+    /// Replace existing files.
+    Always,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractOptions {
+    pub overwrite: Overwrite,
+    /// Restore Unix permission bits when the archive has them
+    /// (never setuid/setgid/sticky).
+    pub restore_permissions: bool,
+    /// Restore modification times.
+    pub restore_mtime: bool,
+    /// Create symlink entries as symlinks (only if the target stays inside
+    /// the destination; otherwise [`Error::UnsafePath`]). When false, they are
+    /// skipped.
+    pub symlinks: bool,
+    /// Only extract entries whose archive path equals one of these or lies
+    /// under one of them (a directory prefix). Empty means everything.
+    /// A pattern that matches no entry is [`Error::NotFound`].
+    pub only: Vec<String>,
+    /// Worker threads. `0` means one per available CPU core.
+    pub threads: usize,
+}
+
+impl Default for ExtractOptions {
+    fn default() -> Self {
+        Self {
+            overwrite: Overwrite::default(),
+            restore_permissions: true,
+            restore_mtime: true,
+            symlinks: true,
+            only: Vec::new(),
+            threads: 0,
+        }
+    }
+}
+
+/// Result of a successful [`extract_archive`].
+#[derive(Debug, Clone)]
+pub struct ExtractSummary {
+    pub files: u64,
+    pub dirs: u64,
+    pub symlinks: u64,
+    /// Existing files left alone under [`Overwrite::Skip`].
+    pub skipped: u64,
+    /// Total bytes written.
+    pub bytes_out: u64,
+    pub elapsed: Duration,
+}
+
+/// Extract the archive at `path` into the directory `dest` (created if missing).
+///
+/// Safety rules, checked for every entry before anything is written: no entry
+/// may resolve outside `dest` (absolute paths, `..`, drive letters, writing
+/// through a symlink); existing files are handled per [`Overwrite`]. Each file
+/// is written to a temporary name and renamed into place only after its CRC-32
+/// and size check out, so a damaged entry never leaves a bad file behind.
+///
+/// `progress` reports files and uncompressed bytes. On cancel, returns
+/// [`Error::Cancelled`]; files already completed stay in place.
+pub fn extract_archive(
+    path: &Path,
+    dest: &Path,
+    opts: &ExtractOptions,
+    progress: &mut dyn FnMut(&Progress),
+    cancel: &AtomicBool,
+) -> Result<ExtractSummary> {
+    extract::extract_archive(path, dest, opts, progress, cancel)
+}
+
+/// A wall-clock date and time in the local time zone, as returned by
+/// [`local_time`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: i64,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+/// `t` as local wall-clock time, using the zone rules (UTC offset and daylight
+/// saving) in force at that instant: the conversion used for the DOS time
+/// fields, offered so front ends can display [`EntryInfo::modified`] the same
+/// way. Falls back to UTC where the local zone can't be determined.
+pub fn local_time(t: std::time::SystemTime) -> LocalTime {
+    let c = timeconv::civil_from_unix_local(timeconv::unix_secs(t));
+    LocalTime {
+        year: c.year,
+        month: c.month,
+        day: c.day,
+        hour: c.hour,
+        minute: c.minute,
+        second: c.second,
+    }
 }
