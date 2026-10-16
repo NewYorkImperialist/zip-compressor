@@ -367,8 +367,10 @@ fn large_file_streams_and_round_trips() {
     let entries = read_entries(&zip);
     assert_eq!(entries.len(), 1);
     assert!(entries[0].data == data, "large file contents differ");
-    // First MiB is random: the probe stores the whole file.
-    assert_eq!(entries[0].method, CompressionMethod::Stored);
+    // The random first half doesn't make it Stored: the compressible second
+    // half is found and deflated.
+    assert_eq!(entries[0].method, CompressionMethod::Deflated);
+    assert!(entries[0].compressed_size < 13 << 20);
     let bad = size_rule_problems(&entries);
     assert!(bad.is_empty(), "{bad:?}");
     assert_layout(&zip, "large file");
@@ -521,7 +523,7 @@ fn local_headers_match_central_directory() {
     let large = td.path().join("large.txt");
     write_file(&large, &compressible_bytes(5 * MIB + 333));
     // Mixed: small files, a chunked file with incompressible chunks, a large
-    // file the probe stores, and small files after them.
+    // file that is Stored (detected incompressible), and small files after them.
     let mixed = td.path().join("mixed");
     write_file(&mixed.join("a.txt"), &compressible_bytes(1000));
     let mut half = compressible_bytes(MIB);
