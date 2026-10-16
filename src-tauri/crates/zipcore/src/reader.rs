@@ -101,6 +101,16 @@ pub(crate) struct CentralEntry {
     pub crc: u32,
     pub compressed: u64,
     pub uncompressed: u64,
+    /// "Version made by": the high byte is the host system (3 = Unix), which
+    /// says how to read `external_attrs`.
+    pub version_made_by: u16,
+    /// MS-DOS modification time and date fields (local time, 2-second steps).
+    pub dos_time: u16,
+    pub dos_date: u16,
+    /// External file attributes (Unix mode in the high 16 bits on Unix hosts).
+    pub external_attrs: u32,
+    /// Central extra field bytes (e.g. the 0x5455 extended timestamp).
+    pub extra: Vec<u8>,
     /// Absolute file offset of the local header (prepended data accounted for).
     pub local_offset: u64,
     /// Problems found while parsing this record.
@@ -363,8 +373,11 @@ fn read_central(rd: &mut impl Read, base: u64) -> Result<CentralEntry, ReadError
     if u32_at(&h, 0) != CENTRAL_SIG {
         return invalid("bad signature (damaged central directory)");
     }
+    let version_made_by = u16_at(&h, 4);
     let flags = u16_at(&h, 8);
     let method = u16_at(&h, 10);
+    let dos_time = u16_at(&h, 12);
+    let dos_date = u16_at(&h, 14);
     let crc = u32_at(&h, 16);
     let csize32 = u32_at(&h, 20);
     let usize32 = u32_at(&h, 24);
@@ -372,6 +385,7 @@ fn read_central(rd: &mut impl Read, base: u64) -> Result<CentralEntry, ReadError
     let extra_len = usize::from(u16_at(&h, 30));
     let comment_len = usize::from(u16_at(&h, 32));
     let disk16 = u16_at(&h, 34);
+    let external_attrs = u32_at(&h, 38);
     let offset32 = u32_at(&h, 42);
     let raw_name = read_vec(rd, name_len)?;
     let extra = read_vec(rd, extra_len)?;
@@ -416,6 +430,11 @@ fn read_central(rd: &mut impl Read, base: u64) -> Result<CentralEntry, ReadError
         crc,
         compressed,
         uncompressed,
+        version_made_by,
+        dos_time,
+        dos_date,
+        external_attrs,
+        extra,
         local_offset,
         problems,
     })
