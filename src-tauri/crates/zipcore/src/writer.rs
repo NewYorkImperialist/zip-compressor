@@ -5,17 +5,21 @@
 //! Work is cut into *units*, identified by `(entry index, chunk number)`:
 //! - a small regular file (< [`codec::BIG_FILE`]) is one unit: a worker opens
 //!   it, reads it whole, computes its CRC and its exact deflated size, and
-//!   keeps Deflate only if that is strictly smaller than the file (else Store);
-//! - a big file is one unit per [`codec::CHUNK`]. Chunk 0 doubles as the
-//!   probe: if one deflate pass (at the level, or level 9 for DeflateBest
-//!   and Zopfli) saves less than 0.1% on it (0.5% at level 1), the whole file is
-//!   Stored (video, archives, photos stay fast). Otherwise every chunk is
-//!   encoded independently (see [`codec`]), each one falling back to stored
-//!   blocks on its own if that is smaller; chunks 1.. are dispatched once the
-//!   probe verdict is in, so they know which method to use. With Zopfli the
-//!   probe sends its verdict as soon as the single
-//!   pass is done, before it goes on to encode chunk 0 properly, so the other
-//!   chunks don't wait for that;
+//!   keeps Deflate only if that is strictly smaller than the file (else
+//!   Store). With `store_incompressible`, a file that [`detect`] finds
+//!   incompressible is Stored without a deflate attempt;
+//! - a big file is one unit per [`codec::CHUNK`], every chunk encoded
+//!   independently (see [`codec`]) and falling back to stored blocks on its
+//!   own if that is smaller. With `store_incompressible`, chunk 0 doubles as
+//!   the probe: the whole file is Stored if [`detect`] finds its first chunk,
+//!   its last MiB and samples of everything in between incompressible (video,
+//!   archives, photos stay fast); otherwise chunks that look incompressible
+//!   on their own are written as stored blocks without a deflate attempt.
+//!   Chunks 1.. are dispatched once the probe verdict is in, so they know
+//!   which method to use; the probe sends its verdict as soon as detection is
+//!   done, before it encodes chunk 0, so the other chunks don't wait for
+//!   that. Without detection a compressed big file is always Deflated, so
+//!   its chunks need no verdict;
 //! - directories and symlinks need no work and are written inline.
 //!
 //! Units run on a dedicated rayon pool of `threads` workers; the workers do
@@ -103,6 +107,7 @@ use std::time::{Duration, Instant};
 
 use crate::codec::{self, Codec, CrcCombiner, Poll, BIG_FILE, DICT};
 use crate::container::{self, CMethod, EntryType, Meta, Sizes};
+use crate::detect;
 use crate::walk::{Entry, Kind};
 use crate::zopfli_codec;
 use crate::{CompressOptions, Error, Method, Progress, Result, Summary};
@@ -382,6 +387,8 @@ struct Shared<'a> {
     stop_after: AtomicUsize,
     /// How to encode, or `None` for Store.
     codec: Option<Codec>,
+    /// `store_incompressible`, while compressing: see [`detect`].
+    detect: bool,
     /// Input bytes slow units have finished so far (Zopfli pieces), for
     /// progress while they run.
     advanced: AtomicU64,
@@ -439,19 +446,22 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// The error for a failed positional read of a big file.
+fn read_error(e: io::Error, path: &Path) -> Error {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        changed_error(path, "file shrank while it was being archived")
+    } else {
+        Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    }
+}
+
 /// Read `[start, end)` of a big file.
 fn read_range(file: &File, start: u64, end: u64, path: &Path) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; (end - start) as usize];
-    read_exact_at(file, &mut buf, start).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            changed_error(path, "file shrank while it was being archived")
-        } else {
-            Error::Io {
-                path: path.to_path_buf(),
-                source: e,
-            }
-        }
-    })?;
+    read_exact_at(file, &mut buf, start).map_err(|e| read_error(e, path))?;
     Ok(buf)
 }
 
@@ -466,6 +476,8 @@ fn shrink(mut v: Vec<u8>) -> Vec<u8> {
 /// where to send an early probe verdict.
 struct Ctx<'a> {
     codec: Option<Codec>,
+    /// Store data that looks incompressible (see [`detect`]).
+    detect: bool,
     poll: Poll<'a>,
     on_decision: &'a dyn Fn(Probe),
 }
@@ -500,8 +512,10 @@ fn run_small(
     file.take(size).read_to_end(&mut raw).map_err(io_err)?;
     let crc = crc32fast::hash(&raw);
     let size = raw.len() as u64;
-    if let Some(codec) = cx.codec.filter(|_| !raw.is_empty()) {
-        let d = codec::encode_unit(&raw, &[], codec, true, None, &cx.poll).map_err(io_err)?;
+    let codec = cx.codec.filter(|_| !raw.is_empty());
+    let skip = codec.is_some() && cx.detect && detect::unit_incompressible(&raw).map_err(io_err)?;
+    if let Some(codec) = codec.filter(|_| !skip) {
+        let d = codec::encode_unit(&raw, &[], codec, true, &cx.poll).map_err(io_err)?;
         let d = cancelled_or(d)?;
         if d.len() < raw.len() {
             return Ok(SmallOut {
@@ -552,26 +566,36 @@ fn run_chunk(
     };
 
     if k == 0 {
-        // The probe: decides the method for the whole file.
+        // The probe: decides the method for the whole file (see `detect`).
         let raw = read_range(&file, start, end, path)?;
         let crc = crc32fast::hash(&raw);
         let tail = tail_crc(&raw);
         let (method, data) = match cx.codec {
             None => (CMethod::Stored, raw),
             Some(codec) => {
-                let d = codec::deflate(&raw, &[], codec.base_level(), last).map_err(io_err)?;
-                if codec.probe_says_deflate(raw.len(), d.len()) {
-                    if codec.slow() {
+                let head_incompressible =
+                    cx.detect && detect::unit_incompressible(&raw).map_err(io_err)?;
+                let stored = head_incompressible
+                    && detect::rest_incompressible(size, &mut |off, buf| {
+                        read_exact_at(&file, buf, off)
+                    })
+                    .map_err(|e| read_error(e, path))?;
+                if stored {
+                    (CMethod::Stored, raw)
+                } else {
+                    if cx.detect {
+                        // Let the other chunks start while this one encodes.
                         (cx.on_decision)(Probe {
                             method: CMethod::Deflated,
                             file: Some(file.clone()),
                         });
                     }
-                    let data = codec::encode_chunk(&raw, &[], codec, last, Some(d), &cx.poll)
-                        .map_err(io_err)?;
+                    let data = if head_incompressible {
+                        Some(codec::stored_chunk(&raw, last))
+                    } else {
+                        codec::encode_chunk(&raw, &[], codec, last, &cx.poll).map_err(io_err)?
+                    };
                     (CMethod::Deflated, shrink(cancelled_or(data)?))
-                } else {
-                    (CMethod::Stored, raw)
                 }
             }
         };
@@ -593,8 +617,11 @@ fn run_chunk(
             let codec = cx.codec.expect("deflated chunk without a codec");
             let buf = read_range(&file, start - DICT as u64, end, path)?;
             let (dict, input) = buf.split_at(DICT);
-            let data =
-                codec::encode_chunk(input, dict, codec, last, None, &cx.poll).map_err(io_err)?;
+            let data = if cx.detect && detect::unit_incompressible(input).map_err(io_err)? {
+                Some(codec::stored_chunk(input, last))
+            } else {
+                codec::encode_chunk(input, dict, codec, last, &cx.poll).map_err(io_err)?
+            };
             Ok(ChunkOut {
                 raw_len: end - start,
                 crc: crc32fast::hash(input),
@@ -642,6 +669,7 @@ fn run_unit(
     };
     let cx = Ctx {
         codec: shared.codec,
+        detect: shared.detect,
         poll: Poll {
             interrupted: &interrupted,
             advanced: &advanced,
@@ -835,14 +863,18 @@ impl<'s, W: Write + Seek> Engine<'s, '_, W> {
     }
 
     /// Method (and open file) for the chunks of big entry `idx`, if known.
+    /// Only detection can make a compressed big file Stored, so without it
+    /// the method is known before the probe has run.
     fn decision(&self, idx: usize) -> Option<Probe> {
-        if self.compressing() {
-            self.decisions.get(&idx).cloned()
+        let known = |method| Probe { method, file: None };
+        if !self.compressing() {
+            Some(known(CMethod::Stored))
+        } else if let Some(p) = self.decisions.get(&idx) {
+            Some(p.clone())
+        } else if !self.shared.detect {
+            Some(known(CMethod::Deflated))
         } else {
-            Some(Probe {
-                method: CMethod::Stored,
-                file: None,
-            })
+            None
         }
     }
 
@@ -1334,6 +1366,7 @@ pub(crate) fn write_archive<W: Write + Seek>(
         abort: AtomicBool::new(false),
         stop_after: AtomicUsize::new(usize::MAX),
         codec,
+        detect: opts.store_incompressible && codec.is_some(),
         advanced: AtomicU64::new(0),
         readahead: readahead::depth_for(threads),
     };

@@ -11,7 +11,8 @@
 //! chunk outputs is therefore one valid deflate stream.
 //!
 //! Each chunk is emitted either as its deflate output or, when that is not
-//! smaller, as deflate *stored* blocks (5 bytes of framing per 65535 bytes).
+//! smaller (or [`crate::detect`] finds the chunk incompressible, so it is not
+//! tried), as deflate *stored* blocks (5 bytes of framing per 65535 bytes).
 //! The chunk size is exactly 16 stored blocks, so a stored chunk costs
 //! 80 bytes of framing per 1,048,560 bytes (< 1/13000) and a whole chunked
 //! entry is never larger than `size + size/13000 + 64`.
@@ -119,28 +120,11 @@ fn saves_a_tenth_percent(raw: usize, deflated: usize) -> bool {
 }
 
 impl Codec {
-    /// The single zlib-rs level used for the first attempt and the probe.
+    /// The single zlib-rs level used for the first attempt.
     pub fn base_level(self) -> u32 {
         match self {
             Codec::Deflate(l) => l,
             Codec::Best | Codec::Zopfli { .. } => 9,
-        }
-    }
-
-    /// Whether a chunk costs much more than one zlib-rs pass (Zopfli).
-    pub fn slow(self) -> bool {
-        matches!(self, Codec::Zopfli { .. })
-    }
-
-    /// The probe rule for big files: deflate is used for the whole file if
-    /// its first chunk, deflated at [`Codec::base_level`], is at least 0.5%
-    /// (level 1) or 0.1% (levels 2-9, Best, Zopfli) smaller than its size.
-    pub fn probe_says_deflate(self, raw_len: usize, deflated_len: usize) -> bool {
-        match self {
-            Codec::Deflate(1) => {
-                raw_len > 0 && (deflated_len as u64) * 200 <= (raw_len as u64) * 199
-            }
-            _ => saves_a_tenth_percent(raw_len, deflated_len),
         }
     }
 }
@@ -148,8 +132,7 @@ impl Codec {
 /// The smallest deflate encoding of one unit (a whole small file, or a chunk
 /// primed with `dict`) that `codec` finds; not compared with storing.
 ///
-/// `first` is the unit's deflate at [`Codec::base_level`] if the caller
-/// already has it (the probe). For Best and Zopfli, units on which that saves
+/// For Best and Zopfli, units on which the first attempt (level 9) saves
 /// less than 0.1% are taken as is (incompressible data: nothing else will do
 /// meaningfully better, and Zopfli would take minutes for nothing).
 /// Returns `Ok(None)` if interrupted.
@@ -158,13 +141,9 @@ pub(crate) fn encode_unit(
     dict: &[u8],
     codec: Codec,
     last: bool,
-    first: Option<Vec<u8>>,
     poll: &Poll<'_>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let base = match first {
-        Some(d) => d,
-        None => deflate(input, dict, codec.base_level(), last)?,
-    };
+    let base = deflate(input, dict, codec.base_level(), last)?;
     if matches!(codec, Codec::Deflate(_))
         || input.is_empty()
         || !saves_a_tenth_percent(input.len(), base.len())
@@ -235,18 +214,23 @@ pub(crate) fn encode_chunk(
     dict: &[u8],
     codec: Codec,
     last: bool,
-    first: Option<Vec<u8>>,
     poll: &Poll<'_>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let Some(d) = encode_unit(input, dict, codec, last, first, poll)? else {
+    let Some(d) = encode_unit(input, dict, codec, last, poll)? else {
         return Ok(None);
     };
     if d.len() < stored_blocks_len(input.len()) {
         return Ok(Some(d));
     }
+    Ok(Some(stored_chunk(input, last)))
+}
+
+/// One chunk of a deflated big file as stored blocks, without trying to
+/// deflate it (for chunks [`crate::detect`] finds incompressible).
+pub(crate) fn stored_chunk(input: &[u8], last: bool) -> Vec<u8> {
     let mut out = Vec::new();
     stored_blocks(input, last, &mut out);
-    Ok(Some(out))
+    out
 }
 
 /// CRC-32 of a sequence of chunk CRCs, combined in order.
@@ -269,7 +253,7 @@ mod tests {
     use flate2::{Decompress, FlushDecompress, Status};
 
     fn enc(input: &[u8], dict: &[u8], codec: Codec, last: bool) -> Vec<u8> {
-        encode_chunk(input, dict, codec, last, None, &Poll::NONE)
+        encode_chunk(input, dict, codec, last, &Poll::NONE)
             .unwrap()
             .unwrap()
     }
@@ -432,24 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_rule() {
-        let fast = Codec::Deflate(1);
-        assert!(fast.probe_says_deflate(1000, 995));
-        assert!(!fast.probe_says_deflate(1000, 996));
-        assert!(!fast.probe_says_deflate(0, 0));
-        for c in [
-            Codec::Deflate(2),
-            Codec::Deflate(6),
-            Codec::Best,
-            Codec::Zopfli { iterations: 15 },
-        ] {
-            assert!(c.probe_says_deflate(10_000, 9_990), "{c:?}");
-            assert!(!c.probe_says_deflate(10_000, 9_991), "{c:?}");
-            assert!(!c.probe_says_deflate(0, 0), "{c:?}");
-        }
-    }
-
-    #[test]
     fn best_tries_more_settings_on_small_whole_files_only() {
         let data = text(200_000);
         let d9 = deflate(&data, &[], 9, true).unwrap();
@@ -587,7 +553,7 @@ mod tests {
             interrupted: &count,
             advanced: &|_| panic!("zopfli ran"),
         };
-        let out = encode_chunk(&n, &[], Codec::Zopfli { iterations: 15 }, true, None, &poll)
+        let out = encode_chunk(&n, &[], Codec::Zopfli { iterations: 15 }, true, &poll)
             .unwrap()
             .unwrap();
         assert_eq!(calls.get(), 0);
@@ -602,15 +568,11 @@ mod tests {
             advanced: &|_| {},
         };
         for c in [Codec::Best, Codec::Zopfli { iterations: 1 }] {
-            assert!(encode_chunk(&data, &[], c, true, None, &yes)
-                .unwrap()
-                .is_none());
+            assert!(encode_chunk(&data, &[], c, true, &yes).unwrap().is_none());
         }
         // A single-pass level never polls.
-        assert!(
-            encode_chunk(&data, &[], Codec::Deflate(6), true, None, &yes)
-                .unwrap()
-                .is_some()
-        );
+        assert!(encode_chunk(&data, &[], Codec::Deflate(6), true, &yes)
+            .unwrap()
+            .is_some());
     }
 }

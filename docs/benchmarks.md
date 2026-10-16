@@ -80,3 +80,67 @@ Built by `scripts/fetch-corpus.sh` into `bench-data/` (gitignored):
 - **tiny** — 20,000 seeded, generated text files of 100 B–4 KiB in nested directories.
 - **big** — a 1 GiB file of lightly mutated slices of source/ and silesia/, plus 256 MiB of seeded random bytes.
 - **photos** — macOS wallpapers (HEIC/JPG, up to 50 MB); already-compressed data.
+
+<!-- kept by scripts/bench.sh: everything below is preserved -->
+## `store_incompressible` (2026-10-16)
+
+Measured by hand, not by `scripts/bench.sh`: the machine was shared with other
+jobs (load average 30-45 on 8 cores), so wall times were unusable and the
+table gives **CPU time** (user + sys of the process, best of 3), all threads.
+"Before" is commit 003b64d (first-MiB probe for files >= 4 MiB); "on" and
+"off" are this change with `store_incompressible` true (the default) and
+false. Sizes are exact.
+
+Extra datasets: **jars** is a Prism Launcher `libraries/` folder (246 JARs,
+363 MB); **video** 51 macOS system videos (.mov/.mp4, 334 MB); **png** 123
+system PNGs (20 MB); **app** copies of iTerm.app and Maps.app (268 MB).
+`max` ran on photos and png only.
+
+| Dataset | Preset | Before MB | CPU s | On MB | CPU s | Off MB | CPU s | On vs off |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| photos | fast | 36.332 | 0.10 | 36.334 | 0.26 | 36.334 | 0.52 | -0.001% |
+| photos | balanced | 36.284 | 0.84 | 36.288 | 0.35 | 36.284 | 0.87 | +0.011% |
+| photos | best | 36.281 | 0.97 | 36.282 | 0.40 | 36.281 | 1.01 | +0.003% |
+| photos | max | 36.265 | 13.98 | 36.268 | 11.79 | 36.265 | 13.87 | +0.009% |
+| source | balanced | 6.315 | 0.43 | 6.315 | 0.50 | 6.315 | 0.46 | 0 |
+| source | best | 6.272 | 0.98 | 6.272 | 1.04 | 6.272 | 0.98 | 0 |
+| tiny | balanced | 20.450 | 1.61 | 20.450 | 1.67 | 20.450 | 1.66 | 0 |
+| tiny | best | 20.183 | 3.98 | 20.183 | 3.92 | 20.183 | 3.77 | 0 |
+| silesia | fast | 94.108 | 1.33 | 94.108 | 1.41 | 94.108 | 1.33 | 0 |
+| silesia | balanced | 68.899 | 3.45 | 68.899 | 3.33 | 68.899 | 3.34 | 0 |
+| silesia | best | 67.584 | 7.22 | 67.584 | 7.29 | 67.584 | 7.04 | 0 |
+| jars | fast | 357.520 | 2.47 | 343.435 | 4.97 | 343.435 | 4.71 | 0 |
+| jars | balanced | **342.280** | 6.72 | **327.663** | 9.68 | 327.649 | 8.61 | +0.004% |
+| jars | best | 342.179 | 9.39 | 327.526 | 12.85 | 327.512 | 12.04 | +0.004% |
+| video | fast | 333.979 | 1.43 | 332.831 | 3.25 | 332.831 | 4.54 | 0 |
+| video | balanced | 327.764 | 8.09 | 327.867 | 5.30 | 327.764 | 7.89 | +0.031% |
+| video | best | 327.708 | 9.60 | 327.789 | 6.56 | 327.708 | 9.87 | +0.025% |
+| png | balanced | 11.647 | 0.32 | 11.647 | 0.27 | 11.647 | 0.30 | 0 |
+| png | max | 11.169 | 72.69 | 11.169 | 73.79 | 11.169 | 74.55 | 0 |
+| app | balanced | 120.230 | 5.10 | 120.282 | 4.72 | 120.230 | 5.07 | +0.044% |
+| app | best | 118.349 | 12.85 | 118.401 | 11.59 | 118.349 | 12.02 | +0.044% |
+| 256 MiB random | balanced | 268.436 | 0.75 | 268.436 | 0.78 | 268.456 | 6.54 | -0.008% |
+
+For comparison on jars: `zip -6` 327.51 MB, `ditto -c -k` 327.94 MB.
+
+**The jars gap.** Before, `balanced` made jars 4.5% larger than `zip -6`
+(342.3 vs 327.5 MB). Per entry, 14.6 of the 14.8 MB difference came from four
+Minecraft client JARs (95 MB) that were Stored whole although level 6 shrinks
+them by 13-24%: signed JARs start with a multi-MB deflated `MANIFEST.MF` and
+signature file, so the old probe (one deflate pass over the first MiB, store
+the whole file if it saved < 0.1%) saw nothing to gain, while the class files
+and central directory after it compress well. The rest (0.2 MB, 0.1% of the
+chunked JARs) is chunking overhead. Now a big file is Stored only if its first
+and last MiB and samples throughout look incompressible; otherwise it is
+deflated with incompressible chunks as stored blocks. Jars `balanced` is now
+327.66 MB, within 0.05% of `zip -6`, at the cost of really compressing those
+95 MB (more CPU than before, which wrongly skipped them).
+
+Detection pays off at `balanced` and above (photos 2.5x less CPU than with
+the option off, video 1.5x, random data 8x). At `fast` the level-2 samples
+cost about as much as level 1 itself, so it saves little there, and photos
+take more CPU than before (0.26 vs 0.10 s), when the old probe looked at only
+the first MiB of each big file; video at `fast` also does more work than
+before because files the old probe stored are now found compressible (-0.34%
+size). MP4 and JARs mostly deflate by 1-15% and are kept deflated. Source, tiny and Silesia archives are byte-identical
+with the option on or off (CI baseline unchanged).
