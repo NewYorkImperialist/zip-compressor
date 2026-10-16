@@ -186,7 +186,10 @@ pub(crate) fn diff_archive(
             let under = candidates.peek().is_some()
                 && candidates
                     .all(|(e, c)| c.first() == Some(&top.as_str()) && (c.len() > 1 || e.is_dir()));
-            if under {
+            // `dir/<top>` existing means `dir` is where the archive was
+            // extracted (`extract x.zip -d x` makes `x/x/...`), not the folder
+            // that was compressed: compare from the archive root.
+            if under && !dir.join(&top).is_dir() {
                 vec![top]
             } else {
                 Vec::new()

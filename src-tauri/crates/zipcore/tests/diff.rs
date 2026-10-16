@@ -216,6 +216,36 @@ fn symlinks_compare_by_target() {
     assert_eq!(changes(&r), [("link".to_string(), DiffKind::Different)]);
 }
 
+/// `extract out.zip -d data` makes `data/data/...`: comparing against that
+/// destination must pick the archive root, not strip `data/`.
+#[test]
+fn prefix_detection_handles_an_extraction_destination() {
+    let td = tempfile::tempdir().unwrap();
+    let data = tree(td.path());
+    let zip = zip_of(
+        td.path(),
+        std::slice::from_ref(&data),
+        &CompressOptions::default(),
+    );
+    let dest = td.path().join("restore").join("data");
+    zipcore::extract_archive(
+        &zip,
+        &dest,
+        &zipcore::ExtractOptions::default(),
+        &mut |_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let r = diff_ok(&zip, &dest, &DiffOptions::default());
+    assert_eq!(r.prefix, "");
+    assert!(r.is_identical(), "{:?}", changes(&r));
+    // The original folder still gets the `data/` prefix.
+    assert_eq!(
+        diff_ok(&zip, &data, &DiffOptions::default()).prefix,
+        "data/"
+    );
+}
+
 #[test]
 fn prefix_detection_and_explicit_prefix() {
     let td = tempfile::tempdir().unwrap();
