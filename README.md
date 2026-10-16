@@ -89,6 +89,13 @@ To check archives (any ZIP, not only zipc's), like `unzip -t`:
 zipc test out.zip other.zip     # exit 0 if every entry's data and CRC-32 check out
 ```
 
+With `--json`, `zipc test` prints one JSON object per archive, one per line:
+`archive`, `ok`, `entries`, `bytes_checked`, `problems` (each `{entry,
+message}`, `entry` being `null` for archive-level problems) and
+`elapsed_seconds`. An archive that can't be read at all gives
+`{archive, ok: false, error}` instead. The exit status is the same as without
+`--json`.
+
 To see what an archive contains without extracting it:
 
 ```sh
@@ -127,6 +134,57 @@ Options for `zipc extract`:
 Nothing is ever written outside the destination (entries with absolute paths,
 `..` or links pointing out are refused), and each file is checked against its
 CRC-32 before it appears. zipc never prompts; the exit status is as above.
+
+To compare an archive with a directory, like `diff -r` (nothing is extracted
+or written):
+
+```sh
+zipc diff photos.zip photos/                   # sizes and CRC-32s; fast
+zipc diff out.zip project/ --full              # decompress and compare bytes
+zipc diff out.zip restored/ --mode --mtime     # permissions and times too
+```
+
+Each differing path is printed with a marker, then a summary line such as
+`41 same, 1 different, 2 only on disk — differences found`:
+
+| Marker | Meaning |
+|---|---|
+| `M` | contents differ (size, CRC-32 or bytes; or the archive entry is damaged) |
+| `m` | contents match, but mode or mtime differ (only with `--mode`/`--mtime`) |
+| `T` | a file on one side, a directory or symlink on the other |
+| `-` | only in the archive |
+| `+` | only on disk |
+
+Options for `zipc diff`:
+
+- `--full` — decompress every file and compare bytes. By default each disk
+  file's CRC-32 is compared with the one the archive records, which doesn't
+  read the archive's data (its headers are still checked for damage).
+- `--mode`, `--mtime` — also compare Unix permissions (when the archive has
+  them) and modification times (exact to the second for zipc's archives,
+  within 2 seconds for archives that store only DOS times).
+- `--prefix P` — the archive folder that corresponds to DIR. By default it is
+  DIR's own name when every entry is under it (what `zipc compress DIR`
+  makes), otherwise the archive root; `--prefix ""` forces the root.
+- `--exclude PATTERN` — ignore paths matching a gitignore-style pattern
+  (`*.log`, `build/`, `/target`) on both sides; repeatable.
+- `--keep-junk` — compare `.DS_Store`, `__MACOSX/`, `._*`, `Thumbs.db` and
+  `desktop.ini` too (ignored on both sides by default).
+- `-a, --all` — also list matching paths (marked `=`).
+- `-j, --threads N` — worker threads; `0` (default) uses every core.
+- `-q, --quiet` — no progress line.
+- `--json` — one JSON object: `archive`, `dir`, `prefix`, `identical`,
+  `counts` (`same`, `different`, `metadata_differs`, `type_mismatch`,
+  `only_in_archive`, `only_on_disk`), `entries` (every path, including
+  matching ones, each `{path, kind, detail}`) and `elapsed_seconds`. If the
+  comparison can't be made, `{archive, dir, error}`.
+
+Symlinks on disk are never followed; they are compared with the archive's
+symlink entries by target. Entry names that would point outside DIR
+(absolute, `..`) are reported as only in the archive and never looked up.
+
+Exit status for `zipc diff`: 0 identical, 1 differences found, 2 usage error,
+3 could not compare (archive unreadable, DIR missing), 130 interrupted.
 
 ## Desktop app
 

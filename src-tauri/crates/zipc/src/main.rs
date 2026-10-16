@@ -1,6 +1,7 @@
 //! `zipc` — command-line front end for `zipcore`.
 
 mod compress;
+mod diff;
 mod extract;
 mod json;
 mod list;
@@ -14,6 +15,9 @@ use clap::{Parser, Subcommand};
 
 /// Exit status when the user interrupts a run (128 + SIGINT).
 const EXIT_CANCELLED: u8 = 130;
+/// Exit status of `zipc diff` when the comparison could not be made at all
+/// (archive unreadable, directory missing), told apart from 1 ("differs").
+const EXIT_TROUBLE: u8 = 3;
 
 const PRESETS_HELP: &str = "\
 Presets (zipc compress -p PRESET); every archive opens with the built-in unzip on any OS:
@@ -36,8 +40,10 @@ Examples:
   zipc list -l out.zip
   zipc extract out.zip -d restored/
   zipc test out.zip
+  zipc diff out.zip photos/
 
-Exit status: 0 success, 1 failure, 2 usage error, 130 interrupted (Ctrl-C).";
+Exit status: 0 success, 1 failure, 2 usage error, 130 interrupted (Ctrl-C).
+zipc diff: 0 identical, 1 differences found, 3 could not compare.";
 
 const LIST_HELP: &str = "\
 Examples:
@@ -56,6 +62,20 @@ Examples:
   zipc extract photos.zip
   zipc extract photos.zip -d ~/Pictures --skip-existing
   zipc extract photos.zip 2024/ notes.txt";
+
+const DIFF_HELP: &str = "\
+Each differing path is printed with a marker, then a summary line:
+  M  contents differ          m  only mode/mtime differ (--mode, --mtime)
+  T  file vs directory/link   -  only in the archive    +  only on disk
+With --all, matching paths are listed too, marked =.
+
+Exit status: 0 identical, 1 differences found, 2 usage error,
+3 could not compare (archive unreadable, DIR missing), 130 interrupted.
+
+Examples:
+  zipc diff photos.zip photos/
+  zipc diff out.zip project/ --full --exclude target/ --exclude '*.log'
+  zipc diff out.zip restored/ --mode --mtime --json";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -86,6 +106,10 @@ enum Command {
     /// Nothing is written outside the destination folder.
     #[command(after_help = EXTRACT_HELP)]
     Extract(extract::ExtractArgs),
+    /// Compare an archive with a directory, like `diff -r`: which paths
+    /// match, differ, or exist on one side only. Writes nothing.
+    #[command(after_help = DIFF_HELP)]
+    Diff(diff::DiffArgs),
 }
 
 /// How a subcommand finished, mapped to the process exit status.
@@ -93,6 +117,8 @@ pub enum Outcome {
     Ok,
     /// Finished, but found problems (already reported); exit status 1.
     Failed,
+    /// The work could not be done at all (already reported); exit status 3.
+    Trouble,
     Cancelled,
 }
 
@@ -103,10 +129,12 @@ fn main() -> ExitCode {
         Command::Test(args) => testcmd::run(args),
         Command::List(args) => list::run(args),
         Command::Extract(args) => extract::run(args),
+        Command::Diff(args) => diff::run(args),
     };
     match result {
         Ok(Outcome::Ok) => ExitCode::SUCCESS,
         Ok(Outcome::Failed) => ExitCode::FAILURE,
+        Ok(Outcome::Trouble) => ExitCode::from(EXIT_TROUBLE),
         Ok(Outcome::Cancelled) => {
             eprintln!("cancelled");
             ExitCode::from(EXIT_CANCELLED)

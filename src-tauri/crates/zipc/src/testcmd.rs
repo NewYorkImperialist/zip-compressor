@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::Args;
 use zipcore::{Error, TestReport};
 
+use crate::json::{self, Object, Value};
 use crate::progress::{install_cancel_handler, ProgressLine};
 use crate::units::format_bytes;
 use crate::Outcome;
@@ -20,6 +21,10 @@ pub struct TestArgs {
     /// Do not show progress.
     #[arg(short, long)]
     quiet: bool,
+
+    /// Print one JSON object per archive, one per line.
+    #[arg(long)]
+    json: bool,
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {
@@ -57,7 +62,11 @@ pub fn run(args: TestArgs) -> Result<Outcome> {
         bar.finish();
         match result {
             Ok(report) => {
-                print_report(&name, &report);
+                if args.json {
+                    println!("{}", report_json(&name, &report));
+                } else {
+                    print_report(&name, &report);
+                }
                 if !report.is_ok() {
                     failed += 1;
                 }
@@ -65,7 +74,11 @@ pub fn run(args: TestArgs) -> Result<Outcome> {
             Err(Error::Cancelled) => return Ok(Outcome::Cancelled),
             Err(e) => {
                 failed += 1;
-                println!("FAILED  {name}");
+                if args.json {
+                    println!("{}", error_json(&name, &e));
+                } else {
+                    println!("FAILED  {name}");
+                }
                 match e {
                     // Already names the file.
                     Error::Io { .. } => eprintln!("zipc: error: {e}"),
@@ -74,7 +87,7 @@ pub fn run(args: TestArgs) -> Result<Outcome> {
             }
         }
     }
-    if args.archives.len() > 1 {
+    if args.archives.len() > 1 && !args.json {
         let total = args.archives.len();
         println!("{} of {total} archives OK", total - failed);
     }
@@ -83,4 +96,63 @@ pub fn run(args: TestArgs) -> Result<Outcome> {
     } else {
         Outcome::Failed
     })
+}
+
+fn report_json(name: &str, r: &TestReport) -> String {
+    let problems = json::array(r.problems.iter().map(|p| {
+        Object::new()
+            .field("entry", p.entry.as_deref())
+            .field("message", p.message.as_str())
+            .finish()
+    }));
+    Object::new()
+        .field("archive", name)
+        .field("ok", r.is_ok())
+        .field("entries", r.entries)
+        .field("bytes_checked", r.bytes_checked)
+        .field("problems", Value::Raw(&problems))
+        .field("elapsed_seconds", Value::F64(r.elapsed.as_secs_f64()))
+        .finish()
+}
+
+fn error_json(name: &str, e: &Error) -> String {
+    Object::new()
+        .field("archive", name)
+        .field("ok", false)
+        .field("error", e.to_string().as_str())
+        .finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use zipcore::Problem;
+
+    #[test]
+    fn json_report() {
+        let r = TestReport {
+            entries: 2,
+            bytes_checked: 10,
+            problems: vec![
+                Problem {
+                    entry: Some("a\"b".into()),
+                    message: "bad CRC-32".into(),
+                },
+                Problem {
+                    entry: None,
+                    message: "prepended data".into(),
+                },
+            ],
+            elapsed: Duration::from_millis(500),
+        };
+        assert_eq!(
+            report_json("x.zip", &r),
+            r#"{"archive":"x.zip","ok":false,"entries":2,"bytes_checked":10,"problems":[{"entry":"a\"b","message":"bad CRC-32"},{"entry":null,"message":"prepended data"}],"elapsed_seconds":0.5}"#
+        );
+        assert_eq!(
+            error_json("y.zip", &Error::InvalidArchive("no end record".into())),
+            r#"{"archive":"y.zip","ok":false,"error":"not a valid ZIP archive: no end record"}"#
+        );
+    }
 }
