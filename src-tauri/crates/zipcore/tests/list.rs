@@ -321,13 +321,21 @@ fn archive_from_the_zip_crate() {
     let td = tempfile::tempdir().unwrap();
     let mut bytes = zip_crate_archive();
     // big.txt's central record really uses ZIP64 (saturated 32-bit sizes).
+    // Also note each record's host system: the zip crate writes some entries
+    // (directories, at least) as DOS-made on Windows, dropping the Unix mode,
+    // and its reader then invents one, which zipcore rightly doesn't report.
     let mut zip64_records = 0;
+    let mut unix_made = Vec::new();
     patch_central(&mut bytes, |rec| {
         if u32::from_le_bytes(rec[20..24].try_into().unwrap()) == u32::MAX {
             zip64_records += 1;
         }
+        unix_made.push(rec[5] == 3);
     });
     assert_eq!(zip64_records, 1, "expected one ZIP64 central record");
+    if cfg!(unix) {
+        assert!(unix_made.iter().all(|&u| u), "all Unix-made on Unix");
+    }
     let path = write_archive(td.path(), "zipcrate.zip", &bytes);
     let listing = list_ok(&path);
     let oracle = read_entries(&bytes);
@@ -343,11 +351,12 @@ fn archive_from_the_zip_crate() {
             "docs/link"
         ]
     );
-    for (e, o) in listing.entries.iter().zip(&oracle) {
+    for ((e, o), &unix) in listing.entries.iter().zip(&oracle).zip(&unix_made) {
         assert_eq!(e.uncompressed, o.size, "{}", e.name);
         assert_eq!(e.compressed, o.compressed_size, "{}", e.name);
         assert_eq!(e.crc32, o.crc32, "{}", e.name);
-        assert_eq!(e.unix_mode, o.unix_mode.map(|m| m & 0o7777), "{}", e.name);
+        let want = o.unix_mode.map(|m| m & 0o7777).filter(|_| unix);
+        assert_eq!(e.unix_mode, want, "{}", e.name);
         // The zip crate writes only DOS time: local time within a zone offset
         // of the UTC reading, on a quarter-hour boundary.
         let m = e.modified.expect("modified");
@@ -359,10 +368,17 @@ fn archive_from_the_zip_crate() {
         );
     }
     let get = |n: &str| listing.entries.iter().find(|e| e.name == n).unwrap();
+    let mode_if_unix = |n: &str, mode: u32| {
+        let i = listing.entries.iter().position(|e| e.name == n).unwrap();
+        unix_made[i].then_some(mode)
+    };
     assert_eq!(get("docs/").kind, EntryKind::Dir);
-    assert_eq!(get("docs/").unix_mode, Some(0o750));
+    assert_eq!(get("docs/").unix_mode, mode_if_unix("docs/", 0o750));
     assert_eq!(get("docs/readme.txt").method, 8);
-    assert_eq!(get("docs/readme.txt").unix_mode, Some(0o640));
+    assert_eq!(
+        get("docs/readme.txt").unix_mode,
+        mode_if_unix("docs/readme.txt", 0o640)
+    );
     assert_eq!(get("docs/raw.bin").method, 0);
     assert_eq!(
         get("big.txt").uncompressed,
