@@ -12,6 +12,7 @@ mod codec;
 mod container;
 mod diff;
 mod extract;
+mod filter;
 mod list;
 mod output;
 mod reader;
