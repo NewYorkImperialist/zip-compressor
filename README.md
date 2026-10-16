@@ -89,6 +89,45 @@ To check archives (any ZIP, not only zipc's), like `unzip -t`:
 zipc test out.zip other.zip     # exit 0 if every entry's data and CRC-32 check out
 ```
 
+To see what an archive contains without extracting it:
+
+```sh
+zipc list out.zip               # one name per line, for piping
+zipc list -l out.zip            # size, compressed, ratio, method, modified (local time), name
+zipc list --json out.zip        # one JSON object: archive, archive_bytes, entries, problems
+```
+
+With several archives, `list` and `list -l` print a `path:` heading before
+each; `--json` prints one object per archive, one per line. In JSON,
+`modified` is RFC 3339 UTC (or `null`) and `unix_mode` an octal string such as
+`"0644"` (or `null` for archives made on Windows).
+
+To extract:
+
+```sh
+zipc extract photos.zip                 # into ./photos/ next to the archive
+zipc extract photos.zip -d ~/Pictures   # into a folder of your choice
+zipc extract photos.zip 2024/ notes.txt # only these paths (a folder takes everything under it)
+```
+
+Options for `zipc extract`:
+
+- `-d, --dest DIR` — folder to extract into (created if missing). By default
+  it is a folder next to the archive named after it without `.zip`; if that
+  folder already exists, zipc stops rather than merging into it, unless
+  `--overwrite` or `--skip-existing` is given.
+- `--overwrite` — replace existing files. `--skip-existing` — keep them and
+  extract the rest. Without either, an existing file stops the extraction
+  before anything is written.
+- `--no-permissions`, `--no-mtime`, `--no-symlinks` — don't restore Unix
+  permissions or modification times; skip symbolic links.
+- `-j, --threads N` — worker threads; `0` (default) uses every core.
+- `-q, --quiet` — no progress line. `--json` — print the summary as JSON.
+
+Nothing is ever written outside the destination (entries with absolute paths,
+`..` or links pointing out are refused), and each file is checked against its
+CRC-32 before it appears. zipc never prompts; the exit status is as above.
+
 ## Desktop app
 
 Requires Node.js and the [Tauri prerequisites](https://tauri.app/start/prerequisites/)

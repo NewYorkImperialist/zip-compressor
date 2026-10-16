@@ -14,3 +14,5 @@ ctrlc = "3"
 
 [dev-dependencies]
 tempfile = "3"
+# Parses `--json` output in the CLI tests (the binary writes JSON by hand).
+serde_json = "1"
