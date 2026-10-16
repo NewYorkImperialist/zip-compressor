@@ -464,7 +464,9 @@ pub struct DiffOptions {
     /// Also report modification-time differences (2-second DOS tolerance
     /// unless the archive has an exact extended timestamp).
     pub compare_mtime: bool,
-    /// Ignore OS clutter on disk the same way `CompressOptions::exclude_junk` does.
+    /// Ignore OS clutter the same way `CompressOptions::exclude_junk` does,
+    /// on disk and in the archive (so `__MACOSX/` from macOS's Archive
+    /// Utility doesn't show up as only in the archive).
     pub exclude_junk: bool,
     /// Gitignore-style patterns ignored on both sides.
     pub exclude: Vec<String>,

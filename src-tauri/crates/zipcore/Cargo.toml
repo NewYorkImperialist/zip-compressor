@@ -20,6 +20,9 @@ zopfli = { version = "0.8.4", default-features = false, features = ["std"] }
 rayon = "1"
 # SIMD CRC-32 with `combine` for per-chunk CRCs (the same crate flate2 uses).
 crc32fast = "1.5"
+# Gitignore-style pattern matching (GitignoreBuilder) for `exclude` patterns,
+# so they behave exactly like git's (`dir/`, `/anchored`, `**`, `!negation`).
+ignore = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # localtime_r for converting mtimes to local DOS time.
