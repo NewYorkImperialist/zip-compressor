@@ -171,7 +171,14 @@ fn compress_all_makes_a_valid_archive_and_conflicts_with_store() {
 fn json_summary_is_one_complete_object() {
     let dir = tempfile::tempdir().unwrap();
     let p = make_proj(dir.path());
-    let zip = dir.path().join("out \"q\".zip");
+    // A quote in the name exercises JSON escaping; Windows forbids `"` in
+    // file names, but there every path's backslashes need escaping anyway.
+    let name = if cfg!(windows) {
+        "out.zip"
+    } else {
+        "out \"q\".zip"
+    };
+    let zip = dir.path().join(name);
     let out = compress_ok(&[&p], &zip, &["--json", "-t", "2", "-x", ".git/"]);
     let text = stdout(&out);
     assert_eq!(text.lines().count(), 1, "{text}");
