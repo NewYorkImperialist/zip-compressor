@@ -485,8 +485,10 @@ pub struct DiffEntry {
 #[derive(Debug, Clone)]
 pub struct DiffOptions {
     /// Archive path prefix that corresponds to the directory. `None`: if every
-    /// entry is under `<directory name>/` (what `compress dir` produces), use
-    /// that; otherwise the archive root.
+    /// entry is under `<directory name>/` (what `compress dir` produces) and
+    /// the directory has no subdirectory of that name, use that prefix;
+    /// otherwise the archive root. (`dir/<name>/` existing means `dir` is an
+    /// extraction destination, e.g. after `extract x.zip -d x`.)
     pub prefix: Option<String>,
     /// Decompress and compare bytes instead of comparing size and CRC-32.
     pub full: bool,

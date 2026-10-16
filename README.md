@@ -186,7 +186,7 @@ Options for `zipc diff`:
 - `--prefix P` — the archive folder that corresponds to DIR. By default it is
   DIR's own name when every entry is under it (what `zipc compress DIR`
   makes), otherwise the archive root; `--prefix ""` forces the root.
-- `--exclude PATTERN` — ignore paths matching a gitignore-style pattern
+- `-x, --exclude PATTERN` — ignore paths matching a gitignore-style pattern
   (`*.log`, `build/`, `/target`) on both sides; repeatable.
 - `--keep-junk` — compare `.DS_Store`, `__MACOSX/`, `._*`, `Thumbs.db` and
   `desktop.ini` too (ignored on both sides by default).

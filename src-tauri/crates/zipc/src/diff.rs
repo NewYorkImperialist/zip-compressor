@@ -43,7 +43,7 @@ pub struct DiffArgs {
 
     /// Ignore paths matching this gitignore-style pattern on both sides
     /// (`*.log`, `build/`, `/target`). Repeatable.
-    #[arg(long, value_name = "PATTERN")]
+    #[arg(short = 'x', long, value_name = "PATTERN")]
     exclude: Vec<String>,
 
     /// Compare `.DS_Store`, `__MACOSX/`, `._*`, `Thumbs.db` and `desktop.ini`
