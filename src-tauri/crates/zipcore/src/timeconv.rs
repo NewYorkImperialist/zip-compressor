@@ -1,5 +1,6 @@
 //! Modification-time conversion: `SystemTime` -> DOS date/time + Info-ZIP
-//! extended timestamp (0x5455), and back again for listing.
+//! extended timestamp (0x5455) for writing, and back for listing and
+//! extraction.
 //!
 //! DOS time is local wall-clock time with 2-second granularity and a 1980..=2107
 //! range; readers that understand the extended timestamp field use the exact
@@ -242,79 +243,81 @@ pub(crate) fn ext_timestamp_payload(secs: i64) -> Option<[u8; 5]> {
     Some([0x01, b[0], b[1], b[2], b[3]])
 }
 
-/// Seconds since the Unix epoch for a UTC civil time (Howard Hinnant's
-/// `days_from_civil`), the inverse of [`civil_from_unix_utc`].
+// ---------------------------------------------------------------------------
+// Reading: the inverse conversions, for listing and extraction.
+// ---------------------------------------------------------------------------
+
+/// The mtime in a 0x5455 extended-timestamp payload (as found in a central
+/// record), if its flags byte says one is present (bit 0) and the 4 bytes
+/// are there. The value is a signed 32-bit count of UTC seconds.
+pub(crate) fn ext_timestamp_mtime(payload: &[u8]) -> Option<i64> {
+    let (&flags, rest) = payload.split_first()?;
+    if flags & 0x01 == 0 {
+        return None;
+    }
+    let b: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+    Some(i64::from(i32::from_le_bytes(b)))
+}
+
+/// Unix seconds for a UTC civil time (Howard Hinnant's `days_from_civil`,
+/// the inverse of [`civil_from_unix_utc`]).
 pub(crate) fn unix_from_civil_utc(c: Civil) -> i64 {
     let (m, d) = (i64::from(c.month), i64::from(c.day));
-    let y = if m <= 2 { c.year - 1 } else { c.year };
+    let y = c.year - i64::from(m <= 2);
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
-    let mp = (m + 9) % 12;
+    let mp = (m + 9) % 12; // March = 0
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     days * 86_400 + i64::from(c.hour) * 3600 + i64::from(c.minute) * 60 + i64::from(c.second)
 }
 
-/// `UNIX_EPOCH` shifted by `secs` (which may be negative).
-pub(crate) fn system_time_from_unix(secs: i64) -> Option<SystemTime> {
-    let d = std::time::Duration::from_secs(secs.unsigned_abs());
-    if secs >= 0 {
-        UNIX_EPOCH.checked_add(d)
-    } else {
-        UNIX_EPOCH.checked_sub(d)
-    }
-}
-
-fn days_in_month(year: i64, month: u8) -> u8 {
-    match month {
-        4 | 6 | 9 | 11 => 30,
-        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
-        2 => 28,
-        _ => 31,
-    }
-}
-
-/// Unpack DOS `(time, date)` fields into a civil time; `None` if any field is
-/// out of range (month 0, February 30th, hour 24, 60 seconds, ...).
+/// The civil time in DOS `(time, date)` fields, or `None` when they are not
+/// a real date (zero, as many writers leave them when no time is known;
+/// month 13; 25 o'clock; ...). Day 31 of a 30-day month is let through: the
+/// conversion simply rolls into the next day, as Info-ZIP's does.
 pub(crate) fn civil_from_dos(time: u16, date: u16) -> Option<Civil> {
-    let c = Civil {
+    let month = ((date >> 5) & 0x0f) as u8;
+    let day = (date & 0x1f) as u8;
+    let hour = (time >> 11) as u8;
+    let minute = ((time >> 5) & 0x3f) as u8;
+    let second = ((time & 0x1f) * 2) as u8;
+    let ok = (1..=12).contains(&month) && day >= 1 && hour < 24 && minute < 60 && second < 60;
+    ok.then(|| Civil {
         year: 1980 + i64::from(date >> 9),
-        month: ((date >> 5) & 0xf) as u8,
-        day: (date & 0x1f) as u8,
-        hour: (time >> 11) as u8,
-        minute: ((time >> 5) & 0x3f) as u8,
-        second: ((time & 0x1f) * 2) as u8,
-    };
-    let ok = (1..=12).contains(&c.month)
-        && c.day >= 1
-        && c.day <= days_in_month(c.year, c.month)
-        && c.hour < 24
-        && c.minute < 60
-        && c.second < 60;
-    ok.then_some(c)
+        month,
+        day,
+        hour,
+        minute,
+        second,
+    })
 }
 
-/// The instant a local wall-clock time denotes, using the zone rules in force
-/// on that date (the inverse of [`civil_from_unix_local`]). Falls back to
-/// reading it as UTC where the local zone can't be determined. A time that
-/// falls in a daylight-saving gap or overlap resolves as the OS chooses.
-pub(crate) fn unix_from_civil_local(c: Civil) -> i64 {
+/// Unix seconds for DOS `(time, date)` fields read as local wall-clock time
+/// (with the zone rules in force on that date, mirroring
+/// [`civil_from_unix_local`]); `None` for invalid fields.
+pub(crate) fn unix_from_dos_local(time: u16, date: u16) -> Option<i64> {
+    let c = civil_from_dos(time, date)?;
     #[cfg(unix)]
     {
-        if let Some(t) = unix_from_local_unix(c) {
-            return t;
+        if let Some(s) = unix_from_local_unix(c) {
+            return Some(s);
         }
     }
     #[cfg(windows)]
     {
-        if let Some(t) = unix_from_local_windows(c) {
-            return t;
+        if let Some(s) = unix_from_local_windows(c) {
+            return Some(s);
         }
     }
-    unix_from_civil_utc(c)
+    Some(unix_from_civil_utc(c))
 }
 
+/// `mktime` with `tm_isdst = -1`, so the C library decides whether daylight
+/// saving applied on that date. A wall-clock time that falls in a DST gap or
+/// overlap resolves however the C library resolves it (one of the two
+/// readings); DOS times carry no offset to disambiguate.
 #[cfg(unix)]
 fn unix_from_local_unix(c: Civil) -> Option<i64> {
     // SAFETY: `tm` is plain old data for which all-zero is valid; mktime only
@@ -326,15 +329,15 @@ fn unix_from_local_unix(c: Civil) -> Option<i64> {
     tm.tm_hour = i32::from(c.hour);
     tm.tm_min = i32::from(c.minute);
     tm.tm_sec = i32::from(c.second);
-    tm.tm_isdst = -1; // let the zone rules decide
+    tm.tm_isdst = -1;
     let t = unsafe { libc::mktime(&mut tm) };
-    // -1 is also a valid time (1969-12-31 23:59:59 UTC) but never a DOS one.
+    // -1 is also 1969-12-31 23:59:59, which no DOS time (1980+) can be.
     #[allow(clippy::unnecessary_cast)] // time_t is i32 on some targets
     (t != -1).then_some(t as i64)
 }
 
 /// Windows: `TzSpecificLocalTimeToSystemTimeEx` with the dynamic zone
-/// information, the inverse of [`local_windows`].
+/// information, the inverse of the conversion in `local_windows`.
 #[cfg(windows)]
 fn unix_from_local_windows(c: Civil) -> Option<i64> {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
@@ -343,11 +346,8 @@ fn unix_from_local_windows(c: Civil) -> Option<i64> {
         DYNAMIC_TIME_ZONE_INFORMATION, TIME_ZONE_ID_INVALID,
     };
 
-    let year = u16::try_from(c.year)
-        .ok()
-        .filter(|y| (1601..=30827).contains(y))?;
     let local = SYSTEMTIME {
-        wYear: year,
+        wYear: u16::try_from(c.year).ok()?,
         wMonth: u16::from(c.month),
         wDayOfWeek: 0, // ignored on input
         wDay: u16::from(c.day),
@@ -379,21 +379,81 @@ fn unix_from_local_windows(c: Civil) -> Option<i64> {
     Some(unix_from_civil_utc(u))
 }
 
-/// The mtime (UTC seconds) from a 0x5455 extended-timestamp payload, if its
-/// flags say one is present. In both headers the mtime comes first.
-pub(crate) fn ext_timestamp_mtime(data: &[u8]) -> Option<i64> {
-    let (&flags, rest) = data.split_first()?;
-    if flags & 1 == 0 {
-        return None;
+/// `SystemTime` for Unix seconds (negative = before 1970).
+pub(crate) fn system_time_from_unix(secs: i64) -> SystemTime {
+    use std::time::Duration;
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::from_secs(secs.unsigned_abs())
+    } else {
+        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
     }
-    let b: [u8; 4] = rest.get(..4)?.try_into().ok()?;
-    Some(i64::from(i32::from_le_bytes(b)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn civil_utc_round_trips() {
+        for secs in [
+            0,
+            -1,
+            951_782_400,
+            1_700_000_000,
+            315_532_800,
+            4_354_819_198,
+            -2_208_988_800,
+        ] {
+            assert_eq!(
+                unix_from_civil_utc(civil_from_unix_utc(secs)),
+                secs,
+                "{secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn dos_fields_decode() {
+        let (t, d) = dos_fields(civ(2024, 2, 29, 13, 7, 8));
+        assert_eq!(civil_from_dos(t, d), Some(civ(2024, 2, 29, 13, 7, 8)));
+        assert_eq!(
+            civil_from_dos(DOS_EPOCH.0, DOS_EPOCH.1),
+            Some(civ(1980, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(civil_from_dos(0, 0), None, "all-zero date");
+        assert_eq!(civil_from_dos(0, (13 << 5) | 1), None, "month 13");
+        assert_eq!(civil_from_dos(24 << 11, (1 << 5) | 1), None, "hour 24");
+        assert_eq!(civil_from_dos(30, (1 << 5) | 1), None, "60 seconds");
+    }
+
+    /// Local DOS fields written for an instant read back as that instant
+    /// (to DOS's 2-second resolution).
+    #[test]
+    fn dos_local_round_trips() {
+        for secs in [1_700_000_000i64, 1_689_430_000, 946_684_800] {
+            let (t, d) = dos_datetime(UNIX_EPOCH + Duration::from_secs(secs as u64));
+            assert_eq!(unix_from_dos_local(t, d), Some(secs & !1), "{secs}");
+        }
+        assert_eq!(unix_from_dos_local(0, 0), None);
+    }
+
+    #[test]
+    fn ext_timestamp_reads_back() {
+        for secs in [0i64, -1, 1_700_000_000, i64::from(i32::MIN)] {
+            let p = ext_timestamp_payload(secs).unwrap();
+            assert_eq!(ext_timestamp_mtime(&p), Some(secs));
+        }
+        assert_eq!(ext_timestamp_mtime(&[0, 1, 2, 3, 4]), None, "no mtime flag");
+        assert_eq!(ext_timestamp_mtime(&[1, 1, 2]), None, "truncated");
+        assert_eq!(ext_timestamp_mtime(&[]), None);
+        // Local-header form with atime/ctime flags too: the mtime comes first.
+        assert_eq!(ext_timestamp_mtime(&[7, 5, 0, 0, 0, 9, 9, 9, 9]), Some(5));
+        assert_eq!(
+            system_time_from_unix(-10),
+            UNIX_EPOCH - Duration::from_secs(10)
+        );
+    }
 
     fn civ(year: i64, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Civil {
         Civil {
@@ -551,75 +611,5 @@ mod tests {
         );
         assert_eq!(ext_timestamp_payload(-1), Some([1, 0xff, 0xff, 0xff, 0xff]));
         assert_eq!(ext_timestamp_payload(i64::from(i32::MAX) + 1), None);
-    }
-
-    #[test]
-    fn utc_inverse() {
-        for secs in [
-            0,
-            -1,
-            951_782_400,
-            1_700_000_000,
-            315_532_800,
-            -86_400 * 400,
-            4_102_444_800,
-        ] {
-            assert_eq!(
-                unix_from_civil_utc(civil_from_unix_utc(secs)),
-                secs,
-                "{secs}"
-            );
-        }
-    }
-
-    #[test]
-    fn dos_unpacking() {
-        assert_eq!(
-            civil_from_dos(DOS_EPOCH.0, DOS_EPOCH.1),
-            Some(civ(1980, 1, 1, 0, 0, 0))
-        );
-        let c = civ(2024, 2, 29, 13, 7, 8);
-        let (t, d) = dos_fields(c);
-        assert_eq!(civil_from_dos(t, d), Some(c));
-        assert_eq!(civil_from_dos(0, 0), None, "month 0");
-        let (t, d) = dos_fields(civ(2023, 2, 29, 0, 0, 0));
-        assert_eq!(civil_from_dos(t, d), None, "not a leap year");
-        assert_eq!(civil_from_dos(24 << 11, DOS_EPOCH.1), None, "hour 24");
-        assert_eq!(civil_from_dos(60 << 5, DOS_EPOCH.1), None, "minute 60");
-        assert_eq!(civil_from_dos(30, DOS_EPOCH.1), None, "60 seconds");
-    }
-
-    #[test]
-    fn local_round_trip() {
-        // Away from DST transitions, local -> UTC inverts UTC -> local.
-        for secs in [1_700_000_000i64, 1_689_430_000, 946_684_800] {
-            let c = civil_from_unix_local(secs);
-            assert_eq!(unix_from_civil_local(c), secs, "{secs}");
-        }
-    }
-
-    #[test]
-    fn ext_timestamp_parsing() {
-        let p = ext_timestamp_payload(1_700_000_000).unwrap();
-        assert_eq!(ext_timestamp_mtime(&p), Some(1_700_000_000));
-        assert_eq!(
-            ext_timestamp_mtime(&ext_timestamp_payload(-5).unwrap()),
-            Some(-5)
-        );
-        assert_eq!(ext_timestamp_mtime(&[0, 1, 2, 3, 4]), None, "no mtime flag");
-        assert_eq!(ext_timestamp_mtime(&[1, 1, 2]), None, "truncated");
-        assert_eq!(ext_timestamp_mtime(&[]), None);
-    }
-
-    #[test]
-    fn system_time_signs() {
-        assert_eq!(
-            system_time_from_unix(5),
-            Some(UNIX_EPOCH + Duration::from_secs(5))
-        );
-        assert_eq!(
-            system_time_from_unix(-5),
-            Some(UNIX_EPOCH - Duration::from_secs(5))
-        );
     }
 }

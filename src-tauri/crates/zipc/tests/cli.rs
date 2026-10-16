@@ -666,7 +666,6 @@ fn extract_refuses_existing_default_destination() {
 }
 
 #[test]
-#[ignore = "needs extract_archive"]
 fn extract_into_default_destination() {
     let dir = tempfile::tempdir().unwrap();
     let zip = make_zip(dir.path(), "out.zip", &[]);
@@ -695,7 +694,6 @@ fn extract_into_default_destination() {
 }
 
 #[test]
-#[ignore = "needs extract_archive"]
 fn extract_dest_paths_and_json() {
     let dir = tempfile::tempdir().unwrap();
     let zip = make_zip(dir.path(), "out.zip", &[]);
@@ -723,7 +721,6 @@ fn extract_dest_paths_and_json() {
 }
 
 #[test]
-#[ignore = "needs extract_archive"]
 fn extract_existing_file_needs_a_flag() {
     let dir = tempfile::tempdir().unwrap();
     let zip = make_zip(dir.path(), "out.zip", &[]);
@@ -759,7 +756,6 @@ fn extract_existing_file_needs_a_flag() {
 }
 
 #[test]
-#[ignore = "needs extract_archive"]
 fn extract_corrupt_archive_exits_1() {
     let dir = tempfile::tempdir().unwrap();
     let junk = dir.path().join("junk.zip");
