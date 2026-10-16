@@ -1227,12 +1227,18 @@ fn deeply_nested_names_are_handled_quickly() {
         .collect();
     let zip = write_zip(td.path(), "deep.zip", &build(&entries));
     let dest = td.path().join("out");
+    let out = dest.clone();
+    // 64 KB names are over the 4096-byte path cap: refused up front, quickly,
+    // on every platform (Windows long paths would otherwise let it build a
+    // 16,000-level tree, quadratically slowly).
     let r = with_timeout(60, "deep names", move || {
-        extract(&zip, &dest, &xopts()).map(|s| s.files)
+        extract(&zip, &out, &xopts()).map(|s| s.files)
     });
     match r {
-        Ok(n) => assert_eq!(n, 20),
-        Err(Error::Io { .. }) => {}
-        Err(e) => panic!("unexpected error {e:?}"),
+        Err(Error::Io { source, .. }) => {
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidFilename)
+        }
+        other => panic!("expected the path cap to refuse it, got {other:?}"),
     }
+    assert!(!dest.exists(), "nothing may be written");
 }
